@@ -1,4 +1,4 @@
-[build-system]
+﻿[build-system]
 requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
@@ -41,8 +41,8 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/qzx/klynx"
-"Bug Tracker" = "https://github.com/qzx/klynx/issues"
+"Homepage" = "https://github.com/DeconBear/klynx-dev"
+"Bug Tracker" = "https://github.com/DeconBear/klynx-dev/issues"
 
 [tool.setuptools]
 package-dir = {"" = "."}
@@ -69,3 +69,4 @@ klynx = [
     "**/*.py[cod]",
     "**/__pycache__/*",
 ]
+

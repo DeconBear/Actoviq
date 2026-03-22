@@ -1,4 +1,4 @@
-"""
+﻿"""
 Klynx Agent - 
 PromptBuilderMixin , XML ,
 """
@@ -26,6 +26,12 @@ class PromptBuilderMixin:
     LIGHT_ASSISTANT_PREVIEW_CHARS = 320
     HEAVY_ASSISTANT_PREVIEW_CHARS = 120
     PROGRESS_SUMMARY_MAX_CHARS = 3200
+    CONTEXT_MAX_OPTIONAL_SEGMENTS = 24
+    CONTEXT_MAX_OPTIONAL_SEGMENT_TOKENS = 4000
+    CONTEXT_MAX_OPTIONAL_TOTAL_TOKENS = 32000
+    MJP_TOOL_LEDGER_MAX = 12
+    HYDRATED_TOOL_OUTPUT_MAX_ITEMS = 3
+    HYDRATED_TOOL_OUTPUT_SNIPPET_CHARS = 1200
     DEFAULT_LOW_INFO_TERMS = (
         "",
         "",
@@ -41,6 +47,373 @@ class PromptBuilderMixin:
     )
 
     _PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def _build_context_slice_budget(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        def _coerce(name: str, fallback: int, floor: int, ceil: int) -> int:
+            raw = state.get(name, fallback)
+            try:
+                value = int(raw)
+            except Exception:
+                value = fallback
+            return max(floor, min(value, ceil))
+
+        max_segments = _coerce(
+            "max_context_segments_per_round",
+            int(getattr(self, "CONTEXT_MAX_OPTIONAL_SEGMENTS", 24) or 24),
+            1,
+            200,
+        )
+        max_segment_tokens = _coerce(
+            "max_context_segment_tokens",
+            int(getattr(self, "CONTEXT_MAX_OPTIONAL_SEGMENT_TOKENS", 4000) or 4000),
+            80,
+            100000,
+        )
+        max_total_tokens = _coerce(
+            "max_context_total_optional_tokens",
+            int(getattr(self, "CONTEXT_MAX_OPTIONAL_TOTAL_TOKENS", 32000) or 32000),
+            400,
+            500000,
+        )
+        return {
+            "max_segments": max_segments,
+            "max_segment_tokens": max_segment_tokens,
+            "max_total_tokens": max_total_tokens,
+            "used_segments": 0,
+            "used_tokens": 0,
+            "skipped": [],
+        }
+
+    def _append_context_section(
+        self,
+        *,
+        xml_parts: List[str],
+        token_stats: Dict[str, int],
+        section_name: str,
+        section_xml: str,
+        budget: Optional[Dict[str, Any]] = None,
+        required: bool = False,
+    ) -> bool:
+        payload = str(section_xml or "").strip()
+        if not payload:
+            return False
+
+        section_tokens = TokenCounter.estimate_tokens(payload)
+        include = True
+        skip_reason = ""
+        if not required and isinstance(budget, dict):
+            max_segments = int(budget.get("max_segments", 0) or 0)
+            max_segment_tokens = int(budget.get("max_segment_tokens", 0) or 0)
+            max_total_tokens = int(budget.get("max_total_tokens", 0) or 0)
+            used_segments = int(budget.get("used_segments", 0) or 0)
+            used_tokens = int(budget.get("used_tokens", 0) or 0)
+
+            if max_segments and used_segments >= max_segments:
+                include = False
+                skip_reason = "max_segments"
+            elif max_segment_tokens and section_tokens > max_segment_tokens:
+                include = False
+                skip_reason = "max_segment_tokens"
+            elif max_total_tokens and used_tokens + section_tokens > max_total_tokens:
+                include = False
+                skip_reason = "max_total_tokens"
+
+            if include:
+                budget["used_segments"] = used_segments + 1
+                budget["used_tokens"] = used_tokens + section_tokens
+            elif skip_reason:
+                budget.setdefault("skipped", []).append(
+                    {
+                        "section": section_name,
+                        "reason": skip_reason,
+                        "tokens": section_tokens,
+                    }
+                )
+
+        if not include:
+            return False
+
+        xml_parts.append(payload)
+        token_stats[section_name] = section_tokens
+        return True
+
+    def _extract_latest_user_intent(self, state: Dict[str, Any]) -> str:
+        direct_input = str(state.get("user_input", "") or "").strip()
+        if direct_input:
+            return direct_input
+
+        history = state.get("messages", []) or []
+        if not isinstance(history, list):
+            return ""
+        for msg in reversed(history):
+            if not isinstance(msg, HumanMessage):
+                continue
+            content = str(getattr(msg, "content", "") or "").strip()
+            if not content:
+                continue
+            if "<tool_result" in content.lower():
+                continue
+            return content
+        return ""
+
+    def _build_minimum_judgement_package_xml(
+        self,
+        *,
+        state: Dict[str, Any],
+        task_plan: List[Dict[str, Any]],
+        current_step_id: str,
+        completed_steps: set,
+    ) -> str:
+        latest_intent = self._truncate_text(self._extract_latest_user_intent(state), 280)
+        active_step_id = str(current_step_id or "").strip()
+        if not active_step_id:
+            active_step_id = self._first_pending_step_from_plan(task_plan, completed_steps)
+
+        active_step_title = ""
+        if active_step_id:
+            for idx, step in enumerate(task_plan or []):
+                if isinstance(step, dict):
+                    step_id = str(step.get("id", "") or f"step_{idx + 1}").strip()
+                    if step_id != active_step_id:
+                        continue
+                    active_step_title = str(
+                        step.get("title", "")
+                        or step.get("task", "")
+                        or step.get("name", "")
+                        or step_id
+                    ).strip()
+                    break
+
+        tool_ledger_recent = state.get("tool_ledger_recent", []) or []
+        ledger_lines: List[str] = []
+        if isinstance(tool_ledger_recent, list):
+            for item in tool_ledger_recent[-self.MJP_TOOL_LEDGER_MAX :]:
+                if not isinstance(item, dict):
+                    continue
+                call_id = str(item.get("call_id", "") or "").strip()
+                tool = str(item.get("tool", "") or "").strip()
+                status = str(item.get("status", "") or "").strip() or "unknown"
+                reused = str(bool(item.get("reused", False))).lower()
+                artifact_id = str(item.get("artifact_id", "") or "").strip()
+                summary = self._truncate_text(str(item.get("summary", "") or "").strip(), 160)
+                attr_call = f' call_id="{self._escape_xml(call_id)}"' if call_id else ""
+                attr_tool = f' tool="{self._escape_xml(tool)}"' if tool else ""
+                attr_artifact = f' artifact_id="{self._escape_xml(artifact_id)}"' if artifact_id else ""
+                ledger_lines.append(
+                    f'      <tool_call{attr_call}{attr_tool} status="{self._escape_xml(status)}" reused="{reused}"{attr_artifact}>'
+                    f"{self._escape_xml(summary)}</tool_call>"
+                )
+
+        mjp_lines = ["  <minimum_judgement_package>"]
+        if latest_intent:
+            mjp_lines.append(f"    <latest_user_intent>{self._escape_xml(latest_intent)}</latest_user_intent>")
+        if active_step_id or active_step_title:
+            mjp_lines.append(
+                f'    <active_step id="{self._escape_xml(active_step_id)}">{self._escape_xml(active_step_title)}</active_step>'
+            )
+        if ledger_lines:
+            mjp_lines.append("    <tool_ledger_recent>")
+            mjp_lines.extend(ledger_lines)
+            mjp_lines.append("    </tool_ledger_recent>")
+        if len(mjp_lines) == 1:
+            return ""
+        mjp_lines.append("  </minimum_judgement_package>")
+        return "\n".join(mjp_lines)
+
+    @staticmethod
+    def _extract_query_terms(text: str, max_terms: int = 20) -> List[str]:
+        tokens: List[str] = []
+        seen = set()
+        for raw in re.findall(r"[A-Za-z0-9_./:-]+", str(text or "").lower()):
+            token = str(raw or "").strip()
+            if len(token) < 3 or token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+            if len(tokens) >= max_terms:
+                break
+        return tokens
+
+    def _load_tool_artifact_content(
+        self,
+        artifact: Dict[str, Any],
+        thread_id: str = "",
+    ) -> str:
+        if not isinstance(artifact, dict):
+            return ""
+        direct = str(artifact.get("content", "") or "")
+        if direct:
+            return direct
+        store_key = str(artifact.get("content_store_key", "") or "").strip()
+        store = getattr(self, "store", None)
+        if store_key and store is not None and hasattr(store, "get"):
+            try:
+                payload = str(store.get(store_key) or "")
+                if payload:
+                    return payload
+            except Exception:
+                pass
+        artifact_id = str(artifact.get("id", "") or "").strip()
+        backup_key = f"tool_artifact:{thread_id or 'default'}:{artifact_id}" if artifact_id else ""
+        if backup_key and store is not None and hasattr(store, "get"):
+            try:
+                return str(store.get(backup_key) or "")
+            except Exception:
+                return ""
+        return ""
+
+    @staticmethod
+    def _build_hydrated_excerpt(content: str, terms: List[str], limit: int) -> str:
+        text = str(content or "")
+        if not text:
+            return ""
+        cap = max(int(limit or 0), 200)
+        if len(text) <= cap:
+            return text
+
+        lowered = text.lower()
+        for term in terms:
+            idx = lowered.find(term.lower())
+            if idx < 0:
+                continue
+            left = max(0, idx - int(cap * 0.35))
+            right = min(len(text), left + cap)
+            excerpt = text[left:right]
+            if left > 0:
+                excerpt = "...\n" + excerpt
+            if right < len(text):
+                excerpt = excerpt + "\n..."
+            return excerpt
+
+        head_size = int(cap * 0.6)
+        tail_size = max(cap - head_size, 120)
+        head = text[:head_size]
+        tail = text[-tail_size:] if tail_size < len(text) else ""
+        if tail:
+            return f"{head}\n...\n{tail}"
+        return head
+
+    def _build_hydrated_tool_outputs_xml(
+        self,
+        *,
+        state: Dict[str, Any],
+        current_focus: str,
+        current_task: str,
+        overall_goal: str,
+    ) -> str:
+        artifacts = state.get("tool_artifacts", []) or []
+        if not isinstance(artifacts, list) or not artifacts:
+            return ""
+
+        latest_intent = self._extract_latest_user_intent(state)
+        query_text = " ".join(
+            [
+                str(current_focus or "").strip(),
+                str(current_task or "").strip(),
+                str(overall_goal or "").strip(),
+                str(latest_intent or "").strip(),
+            ]
+        ).strip()
+        query_terms = self._extract_query_terms(query_text, max_terms=24)
+
+        ledger_by_artifact: Dict[str, Dict[str, Any]] = {}
+        for item in state.get("tool_ledger_recent", []) or []:
+            if not isinstance(item, dict):
+                continue
+            artifact_id = str(item.get("artifact_id", "") or "").strip()
+            if artifact_id:
+                ledger_by_artifact[artifact_id] = dict(item)
+
+        scored: List[Dict[str, Any]] = []
+        for recency_idx, artifact in enumerate(reversed(artifacts[-40:]), start=1):
+            if not isinstance(artifact, dict):
+                continue
+            artifact_id = str(artifact.get("id", "") or "").strip()
+            tool_name = str(artifact.get("tool", "") or "").strip()
+            if not artifact_id:
+                continue
+
+            params = artifact.get("params", {}) or {}
+            try:
+                params_text = json.dumps(params, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                params_text = str(params)
+            searchable = f"{tool_name} {params_text}".lower()
+
+            score = max(0, 15 - recency_idx)
+            reasons: List[str] = ["recent"]
+            ledger = ledger_by_artifact.get(artifact_id, {})
+            status = str(ledger.get("status", "") or "").strip().lower()
+            if ledger:
+                score += 4
+                reasons.append("ledger_linked")
+            if status and status != "success":
+                score += 4
+                reasons.append("error_priority")
+            if status == "success":
+                score += 1
+            match_hits = 0
+            for term in query_terms:
+                if term and term in searchable:
+                    match_hits += 1
+            if match_hits:
+                score += min(match_hits, 4)
+                reasons.append("query_match")
+            if tool_name in {"execute_command", "run_in_terminal", "read_terminal", "search_in_files", "load_skill"}:
+                score += 1
+
+            scored.append(
+                {
+                    "score": score,
+                    "artifact": artifact,
+                    "reasons": reasons,
+                    "recency_idx": recency_idx,
+                    "status": status,
+                }
+            )
+
+        if not scored:
+            return ""
+        scored.sort(key=lambda item: (int(item.get("score", 0)), -int(item.get("recency_idx", 0))), reverse=True)
+        max_items = max(int(getattr(self, "HYDRATED_TOOL_OUTPUT_MAX_ITEMS", 3) or 3), 1)
+        snippet_limit = max(int(getattr(self, "HYDRATED_TOOL_OUTPUT_SNIPPET_CHARS", 1200) or 1200), 200)
+        thread_id = str(state.get("thread_id", "") or "").strip()
+
+        lines = ["  <hydrated_tool_outputs policy=\"automatic\" source=\"tool_artifacts\">"]
+        included = 0
+        for item in scored:
+            if included >= max_items:
+                break
+            artifact = dict(item.get("artifact", {}) or {})
+            artifact_id = str(artifact.get("id", "") or "").strip()
+            if not artifact_id:
+                continue
+            content = self._load_tool_artifact_content(artifact, thread_id=thread_id)
+            if not content:
+                continue
+            excerpt = self._build_hydrated_excerpt(content, query_terms, snippet_limit)
+            if not excerpt.strip():
+                continue
+            total_chars = len(content)
+            total_lines = max(len(content.splitlines()), 1)
+            tool_name = str(artifact.get("tool", "") or "").strip()
+            reason_text = ",".join(item.get("reasons", []) or [])
+            lines.append(
+                f'    <artifact id="{self._escape_xml(artifact_id)}" '
+                f'tool="{self._escape_xml(tool_name)}" '
+                f'score="{int(item.get("score", 0) or 0)}" '
+                f'status="{self._escape_xml(str(item.get("status", "") or ""))}" '
+                f'total_lines="{total_lines}" total_chars="{total_chars}" '
+                f'reason="{self._escape_xml(reason_text)}">'
+                f"{self._escape_xml(excerpt)}"
+                "</artifact>"
+            )
+            included += 1
+
+        if included == 0:
+            return ""
+        lines.append("  </hydrated_tool_outputs>")
+        return "\n".join(lines)
 
     def _load_prompt_fragment(self, *relative_parts: str, fallback: str = "") -> str:
         prompt_path = self._PROMPT_DIR.joinpath(*relative_parts)
@@ -101,10 +474,6 @@ class PromptBuilderMixin:
             prompt_parts.append(tool_prompt)
 
         prompt_parts.append(self._load_prompt_fragment("fragments", "tool_selection.md"))
-        if self._is_mimo_model_route():
-            prompt_parts.append(
-                self._load_prompt_fragment("fragments", "task_state_updates_mimo.md")
-            )
 
         runtime_tool_names = set(self._runtime_tool_names())
         has_exec_sessions = bool(
@@ -203,148 +572,14 @@ class PromptBuilderMixin:
             ]
         )
         return "\n\n".join(part for part in (base, examples) if part).strip()
-
     def _get_system_prompt(self) -> str:
         return self._build_modern_system_prompt()
-        """
-        ()
-        
-        Returns:
-            
-        """
-        # Base prompt is provided by concrete agent classes in agents.py.
-        base_system_prompt = (getattr(self, "LOCKED_SYSTEM_PROMPT", "") or "").strip()
 
-        prompt_parts = [base_system_prompt] if base_system_prompt else []
-
-        runtime_append = (getattr(self, "_runtime_system_prompt_append", "") or "").strip()
-        if runtime_append:
-            prompt_parts.append(runtime_append)
-
-        # OS 
-        os_lower = self.os_name.lower()
-        if os_lower in ["linux", "macos", "mac"]:
-            sys_msg = (
-                f" {self.os_name} .."
-                " use execute_command/search_in_files/read_file according to tool responsibilities."
-            )
-        else:
-            sys_msg = (
-                f" {self.os_name} .."
-                " use execute_command/search_in_files/read_file according to tool responsibilities."
-            )
-        prompt_parts.append(f"<system_note>\n  <note>{sys_msg}</note>\n</system_note>")
-
-        # Skills ( skills )
-        skills_prompt = (getattr(self, "_skills_prompt_cache", "") or "").strip()
-        if skills_prompt:
-            prompt_parts.append(skills_prompt)
-        
-        # ()
-        if self._tool_prompts_cache:
-            prompt_parts.append(self._tool_prompts_cache)
-
-        prompt_parts.append(
-            """
-<execution_bias>
-  <rule>Default to execution. Unless the user explicitly asks for planning, design discussion, or option comparison, start with the smallest search, experiment, edit, or verification step.</rule>
-  <rule>Use one main hypothesis per round. At most one backup hypothesis.</rule>
-  <rule>Once you have a direct edit target, patch first and verify next; do not keep reading files without new evidence.</rule>
-  <rule>Only ask the user when the missing information cannot be discovered locally, or when a risky decision requires explicit confirmation.</rule>
-</execution_bias>""".strip()
-        )
-
-        prompt_parts.append(
-            """
-<interactive_execution_rules>
-  <rule>,/// execute_command.</rule>
-  <rule>REPL,shell, exec_command; write_stdin, close_exec_session.</rule>
-  <rule>,,, open_tui / send_keys_and_read / wait_tui_until  TUI .</rule>
-  <rule> python,bash,cmd,node,ipython,vim,top,watch, --mode tui / textual / curses , execute_command.</rule>
-</interactive_execution_rules>""".strip()
-        )
-        
-        # ( memory_dir )
-        prompt_parts.append(
-            """
-<terminal_session_rules>
-  <rule>,,,, execute_command.</rule>
-  <rule>REPL,shell, exec_command; write_stdin, close_exec_session.</rule>
-  <rule>exec_command / launch_interactive_session  session_id( exec_xxx); write_stdin / close_exec_session, read_terminal / wait_terminal_until.</rule>
-  <rule>legacy terminal  create_terminal / run_in_terminal / read_terminal / wait_terminal_until  terminal name, exec_xxx session_id.</rule>
-  <rule>,,, open_tui / send_keys_and_read / wait_tui_until  TUI .</rule>
-  <rule> python,bash,cmd,node,ipython,vim,top,watch, --mode tui / textual / curses , execute_command.</rule>
-  <rule>Windows  shell  PowerShell. cd /d; workdir, Set-Location "path"; your-command, cmd.exe .</rule>
-  <rule> &lt;tui_views&gt; ,;recent_tui_events .</rule>
-</terminal_session_rules>""".strip()
-        )
-        if self.memory_dir:
-            memory_path = os.path.join(self.memory_dir, ".klynx", ".memory")
-            rel_path = os.path.relpath(memory_path, self.working_dir) if self.working_dir else ".klynx/.memory"
-            prompt_parts.append(f"""
-<memory_system>
-  <description>, {rel_path} (XML).</description>
-  <usage>
-    <item>, read_file  {rel_path}</item>
-    <item>,,, {rel_path}</item>
-    <item>, .memory </item>
-    <item> apply_patch </item>
-  </usage>
-  <format>
-    XML,:
-    &lt;memory&gt;
-      &lt;entry key="user_preferences"&gt;&lt;/entry&gt;
-      &lt;entry key="project_architecture"&gt;&lt;/entry&gt;
-    &lt;/memory&gt;
-  </format>
-</memory_system>""")
-        
-        # TUI ( activate_tui_mode )
-        if getattr(self, '_tui_guide_loaded', False):
-            prompt_parts.append(self._get_tui_guide())
-        
-        return "\n".join(prompt_parts)
-    
     def _get_tui_guide(self) -> str:
         return self._build_modern_tui_guide()
-        """ TUI ( activate_tui_mode  system prompt)"""
-        return """
-<tui_interaction_guide>
-  <description> TUI .; TUI.</description>
-  <workflow>
-    <rule> send_keys_and_read, send_keys + read_tui.</rule>
-    <rule>, wait_tui_until.</rule>
-    <rule>, read_tui_diff,read_tui_region,find_text_in_tui.</rule>
-    <rule> read_tui ;.</rule>
-    <rule> Space. close_tui .</rule>
-  </workflow>
-  <key_reference>
-    <keys>Enter, Tab, Escape, Backspace, Delete, Space, Up, Down, Left, Right, Home, End, PageUp, PageDown, Ctrl-C, Ctrl-D, F1-F12</keys>
-  </key_reference>
-  <examples>
-    <example>i hello Space world Escape</example>
-    <example>Escape :wq Enter</example>
-    <example>Ctrl-C</example>
-  </examples>
-</tui_interaction_guide>"""
-
-    def _get_tools_prompt(self) -> str:
-        """
-         prompt ()
-        
-        Returns:
-            XML 
-        """
-        if not self.tools:
-            return ""
-        
-        lines = []
-        for name, desc in self.tools.items():
-            lines.append(f"  - {name}: {desc}")
-        return "\n".join(lines)
 
     def _get_tool_names_prompt(self) -> str:
-        """, system ."""
+        """Return a compact comma-separated list of active tool names."""
         if not self.tools:
             return "()"
         names = sorted(self.tools.keys())
@@ -402,13 +637,13 @@ class PromptBuilderMixin:
         
         for i, entry in enumerate(entries):
             is_last = (i == len(entries) - 1)
-            connector = "└── " if is_last else "├── "
+            connector = "鈹斺攢鈹€ " if is_last else "鈹溾攢鈹€ "
             entry_path = os.path.join(path, entry)
             
             if os.path.isdir(entry_path):
                 lines.append(f"{prefix}{connector}{entry}/")
                 if depth > 0:
-                    extension = "    " if is_last else "│   "
+                    extension = "    " if is_last else "鈹?  "
                     subtree = self._generate_file_tree(entry_path, depth - 1, prefix + extension)
                     if subtree:
                         lines.append(subtree)
@@ -416,77 +651,6 @@ class PromptBuilderMixin:
                 lines.append(f"{prefix}{connector}{entry}")
         
         return "\n".join(lines)
-
-    def _parse_model_response(self, response) -> Dict[str, str]:
-        """
-         -  DeepSeek 
-        
-        DeepSeek :
-        - reasoning_content: ()
-        - content: 
-        
-        Args:
-            response: 
-            
-        Returns:
-             reasoning_content  content 
-        """
-        result = {
-            "reasoning_content": "",
-            "content": ""
-        }
-        
-        # 
-        message = response
-        if hasattr(response, 'choices') and response.choices:
-            message = response.choices[0].message
-        
-        #  reasoning_content(DeepSeek )
-        if hasattr(message, 'reasoning_content') and message.reasoning_content:
-            result["reasoning_content"] = message.reasoning_content
-        elif hasattr(message, 'additional_kwargs'):
-            # : additional_kwargs 
-            result["reasoning_content"] = message.additional_kwargs.get('reasoning_content', '')
-        
-        #  content
-        if hasattr(message, 'content'):
-            result["content"] = message.content or ""
-        
-        return result
-    
-    def _extract_reasoning_content(self, response) -> str:
-        """
-         DeepSeek  (reasoning_content)
-        
-        :
-        1. response.reasoning_content ( - LiteLLMResponse)
-        2. response.additional_kwargs['reasoning_content']
-        3. response.response_metadata['reasoning_content']
-        
-        Args:
-            response: 
-            
-        Returns:
-            
-        """
-        # 1:  (LiteLLMResponse)
-        if hasattr(response, 'reasoning_content') and response.reasoning_content:
-            return response.reasoning_content
-        
-        # 2: additional_kwargs
-        if hasattr(response, 'additional_kwargs') and response.additional_kwargs:
-            rc = response.additional_kwargs.get('reasoning_content', '')
-            if rc:
-                return rc
-        
-        # 3: response_metadata
-        if hasattr(response, 'response_metadata') and response.response_metadata:
-            rc = response.response_metadata.get('reasoning_content', '')
-            if rc:
-                return rc
-        
-        return ""
-
     def _is_mimo_model_route(self) -> bool:
         model_obj = getattr(self, "model", None)
         route = str(getattr(model_obj, "model", "") or "").strip().lower()
@@ -562,17 +726,39 @@ class PromptBuilderMixin:
 
             tool_name = ""
             params: Any = {}
+            call_id = ""
 
             if raw_call.get("tool"):
                 tool_name = str(raw_call.get("tool", "")).strip()
                 params = raw_call.get("params", {})
+                call_id = str(
+                    raw_call.get("call_id", "")
+                    or raw_call.get("id", "")
+                    or raw_call.get("tool_call_id", "")
+                    or ""
+                ).strip()
             elif isinstance(raw_call.get("function"), dict):
                 function_block = raw_call.get("function", {}) or {}
                 tool_name = str(function_block.get("name", "")).strip()
                 params = function_block.get("arguments", {})
+                call_id = str(
+                    raw_call.get("call_id", "")
+                    or raw_call.get("id", "")
+                    or raw_call.get("tool_call_id", "")
+                    or function_block.get("call_id", "")
+                    or function_block.get("id", "")
+                    or function_block.get("tool_call_id", "")
+                    or ""
+                ).strip()
             elif raw_call.get("name"):
                 tool_name = str(raw_call.get("name", "")).strip()
                 params = raw_call.get("arguments", {})
+                call_id = str(
+                    raw_call.get("call_id", "")
+                    or raw_call.get("id", "")
+                    or raw_call.get("tool_call_id", "")
+                    or ""
+                ).strip()
 
             if not tool_name:
                 continue
@@ -586,6 +772,7 @@ class PromptBuilderMixin:
                     "source": "native",
                     "tool": tool_name,
                     "params": normalized_params,
+                    "call_id": call_id,
                 }
             )
         return calls
@@ -603,7 +790,11 @@ class PromptBuilderMixin:
                 params_fingerprint = json.dumps(event.get("params", {}), ensure_ascii=False, sort_keys=True)
             except Exception:
                 params_fingerprint = str(event.get("params", ""))
-            key = (event.get("tool", ""), params_fingerprint)
+            key = (
+                event.get("call_id", ""),
+                event.get("tool", ""),
+                params_fingerprint,
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -621,51 +812,91 @@ class PromptBuilderMixin:
             return []
 
         canonical: List[BaseMessage] = []
-        pending_tools: List[str] = []
+        pending_calls: List[Dict[str, str]] = []
+        pending_by_call_id: Dict[str, Dict[str, str]] = {}
 
         for message in messages:
             if isinstance(message, AIMessage):
                 canonical.append(message)
                 for call in self._collect_native_tool_calls(message):
                     tool_name = str(call.get("tool", "") or "").strip()
-                    if tool_name:
-                        pending_tools.append(tool_name)
+                    call_id = str(call.get("call_id", "") or "").strip()
+                    if not tool_name:
+                        continue
+                    entry = {
+                        "tool": tool_name,
+                        "call_id": call_id,
+                    }
+                    pending_calls.append(entry)
+                    if call_id:
+                        pending_by_call_id[call_id] = entry
                 continue
 
             if isinstance(message, HumanMessage):
                 content = str(getattr(message, "content", "") or "")
                 if "<tool_result" in content.lower():
-                    if pending_tools:
-                        pending_tools.pop(0)
-                        canonical.append(message)
+                    tool_name = self._extract_tool_result_name(content) or "unknown"
+                    result_call_id = self._extract_tool_result_call_id(content)
+                    resolved_call_id = result_call_id
+                    if result_call_id and result_call_id in pending_by_call_id:
+                        matched_entry = pending_by_call_id.pop(result_call_id)
+                        pending_calls = [
+                            entry
+                            for entry in pending_calls
+                            if not (
+                                str(entry.get("call_id", "") or "").strip() == result_call_id
+                                and str(entry.get("tool", "") or "").strip()
+                                == str(matched_entry.get("tool", "") or "").strip()
+                            )
+                        ]
+                        canonical.append(HumanMessage(content=content))
+                    elif pending_calls:
+                        match_index = -1
+                        for idx, entry in enumerate(pending_calls):
+                            if str(entry.get("tool", "") or "").strip() == tool_name:
+                                match_index = idx
+                                break
+                        if match_index < 0:
+                            match_index = 0
+                        matched_entry = pending_calls.pop(match_index)
+                        resolved_call_id = str(matched_entry.get("call_id", "") or "").strip() or result_call_id
+                        if resolved_call_id:
+                            pending_by_call_id.pop(resolved_call_id, None)
+                        content = self._ensure_tool_result_call_id(content, resolved_call_id)
+                        canonical.append(HumanMessage(content=content))
                     else:
-                        inferred_tool = self._extract_tool_result_name(content) or "unknown"
+                        synthetic_call_id = result_call_id or f"orphan_call_{len(canonical)}"
+                        content = self._ensure_tool_result_call_id(content, synthetic_call_id)
                         canonical.append(
                             AIMessage(
                                 content="",
                                 additional_kwargs={
                                     "tool_calls": [
                                         {
-                                            "tool": inferred_tool,
+                                            "tool": tool_name,
                                             "params": {},
+                                            "call_id": synthetic_call_id,
                                         }
                                     ]
                                 },
                             )
                         )
-                        canonical.append(message)
+                        canonical.append(HumanMessage(content=content))
                     continue
                 canonical.append(message)
                 continue
 
             canonical.append(message)
 
-        for tool_name in pending_tools:
+        for pending in pending_calls:
+            tool_name = str(pending.get("tool", "") or "").strip()
+            call_id = str(pending.get("call_id", "") or "").strip()
             safe_tool = self._escape_xml(str(tool_name or "").strip() or "unknown")
+            call_attr = f' call_id="{self._escape_xml(call_id)}"' if call_id else ""
             canonical.append(
                 HumanMessage(
                     content=(
-                        f'<tool_result tool="{safe_tool}" status="interrupted">'
+                        f'<tool_result tool="{safe_tool}" status="interrupted"{call_attr}>'
                         "interrupted: missing tool output for this call"
                         "</tool_result>"
                     )
@@ -965,13 +1196,15 @@ class PromptBuilderMixin:
     def _format_tool_event_text(self, event: Dict[str, Any]) -> str:
         """."""
         tool_name = str(event.get("tool", "")).strip() or "unknown"
+        call_id = str(event.get("call_id", "") or "").strip()
         params = event.get("params", {})
         try:
             params_text = json.dumps(params, ensure_ascii=False, sort_keys=True)
         except Exception:
             params_text = str(params)
         source = str(event.get("source", "unknown"))
-        return f"[{source}] {tool_name}({params_text})"
+        call_prefix = f"{call_id} " if call_id else ""
+        return f"[{source}] {call_prefix}{tool_name}({params_text})"
 
     @staticmethod
     def _normalize_compare_text(text: str) -> str:
@@ -1114,6 +1347,7 @@ class PromptBuilderMixin:
             "convergence_mode": 0,
             "command_executions": 0,
             "tool_artifacts_index": 0,
+            "hydrated_tool_outputs": 0,
             "summary_events": 0,
             "step_checkpoints": 0,
             "archived_history": 0,
@@ -1121,7 +1355,10 @@ class PromptBuilderMixin:
             "context_summary": 0,
             "document_content": 0,
             "skill_context": 0,
+            "minimum_judgement_package": 0,
+            "context_slice_budget": 0,
         }
+        context_slice_budget = self._build_context_slice_budget(state)
         
         # ()
         existing_context = state.get("context", "")
@@ -1278,6 +1515,22 @@ class PromptBuilderMixin:
             xml_parts.append(plan_xml)
             token_stats["task_plan"] = TokenCounter.estimate_tokens(plan_xml)
 
+        mjp_xml = self._build_minimum_judgement_package_xml(
+            state=state,
+            task_plan=task_plan if isinstance(task_plan, list) else [],
+            current_step_id=current_step_id,
+            completed_steps=completed_steps,
+        )
+        if mjp_xml:
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="minimum_judgement_package",
+                section_xml=mjp_xml,
+                budget=None,
+                required=True,
+            )
+
         if should_plan:
             step_execution_stats = state.get("step_execution_stats", {}) or {}
             active_step_id = current_step_id or self._first_pending_step_from_plan(task_plan, completed_steps)
@@ -1356,8 +1609,14 @@ class PromptBuilderMixin:
                 )
             if coverage_lines:
                 coverage_xml = "  <read_coverage>\n" + "\n".join(coverage_lines) + "\n  </read_coverage>"
-                xml_parts.append(coverage_xml)
-                token_stats["read_coverage"] = TokenCounter.estimate_tokens(coverage_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="read_coverage",
+                    section_xml=coverage_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
 
         evidence_index = state.get("evidence_index", []) or []
         if isinstance(evidence_index, list) and evidence_index:
@@ -1386,13 +1645,25 @@ class PromptBuilderMixin:
                 )
             if evidence_lines:
                 evidence_xml = "  <evidence_index>\n" + "\n".join(evidence_lines) + "\n  </evidence_index>"
-                xml_parts.append(evidence_xml)
-                token_stats["evidence_index"] = TokenCounter.estimate_tokens(evidence_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="evidence_index",
+                    section_xml=evidence_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
 
         file_views_xml = self._render_file_views_xml(state, current_focus)
         if file_views_xml:
-            xml_parts.append(file_views_xml)
-            token_stats["file_views"] = TokenCounter.estimate_tokens(file_views_xml)
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="file_views",
+                section_xml=file_views_xml,
+                budget=context_slice_budget,
+                required=False,
+            )
 
         search_hits_index = state.get("search_hits_index", []) or []
         if isinstance(search_hits_index, list) and search_hits_index:
@@ -1426,8 +1697,14 @@ class PromptBuilderMixin:
                     + "\n".join(search_hit_lines)
                     + "\n  </search_hits_index>"
                 )
-                xml_parts.append(search_hits_xml)
-                token_stats["search_hits_index"] = TokenCounter.estimate_tokens(search_hits_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="search_hits_index",
+                    section_xml=search_hits_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
 
         file_candidates = state.get("file_candidates", []) or []
         if isinstance(file_candidates, list) and file_candidates:
@@ -1455,8 +1732,14 @@ class PromptBuilderMixin:
                     + "\n".join(candidate_lines)
                     + "\n  </file_candidates>"
                 )
-                xml_parts.append(candidates_xml)
-                token_stats["file_candidates"] = TokenCounter.estimate_tokens(candidates_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="file_candidates",
+                    section_xml=candidates_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
 
         trusted_modified_files = [
             str(item).strip()
@@ -1484,8 +1767,14 @@ class PromptBuilderMixin:
             if patch_lines:
                 patch_xml += "    <last_patch_summaries>\n" + "\n".join(patch_lines) + "\n    </last_patch_summaries>\n"
             patch_xml += "  </patch_evidence>"
-            xml_parts.append(patch_xml)
-            token_stats["patch_summaries"] = TokenCounter.estimate_tokens(patch_xml)
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="patch_summaries",
+                section_xml=patch_xml,
+                budget=context_slice_budget,
+                required=False,
+            )
 
         last_mutation = dict(state.get("last_mutation", {}) or {})
         recent_mutations = state.get("recent_mutations", []) or []
@@ -1536,8 +1825,14 @@ class PromptBuilderMixin:
             )
             mutation_lines.append("  </mutation_truth>")
             mutation_xml = "\n".join(mutation_lines)
-            xml_parts.append(mutation_xml)
-            token_stats["mutation_truth"] = TokenCounter.estimate_tokens(mutation_xml)
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="mutation_truth",
+                section_xml=mutation_xml,
+                budget=context_slice_budget,
+                required=False,
+            )
 
         recent_terminal_events = state.get("recent_terminal_events", []) or []
         if isinstance(recent_terminal_events, list) and recent_terminal_events:
@@ -1555,8 +1850,14 @@ class PromptBuilderMixin:
                 )
             if terminal_lines:
                 terminal_xml = "  <recent_terminal_events>\n" + "\n".join(terminal_lines) + "\n  </recent_terminal_events>"
-                xml_parts.append(terminal_xml)
-                token_stats["terminal_events"] = TokenCounter.estimate_tokens(terminal_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="terminal_events",
+                    section_xml=terminal_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
 
         recent_exec_sessions = state.get("recent_exec_sessions", []) or []
         active_exec_session = dict(state.get("active_exec_session", {}) or {})
@@ -1588,13 +1889,25 @@ class PromptBuilderMixin:
                 )
             if exec_lines:
                 exec_xml = "  <recent_exec_sessions>\n" + "\n".join(exec_lines) + "\n  </recent_exec_sessions>"
-                xml_parts.append(exec_xml)
-                token_stats["exec_sessions"] = TokenCounter.estimate_tokens(exec_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="exec_sessions",
+                    section_xml=exec_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
 
         tui_views_xml = self._render_tui_views_xml(state, current_focus)
         if tui_views_xml:
-            xml_parts.append(tui_views_xml)
-            token_stats["tui_views"] = TokenCounter.estimate_tokens(tui_views_xml)
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="tui_views",
+                section_xml=tui_views_xml,
+                budget=context_slice_budget,
+                required=False,
+            )
 
         recent_tui_events = state.get("recent_tui_events", []) or []
         if isinstance(recent_tui_events, list) and recent_tui_events:
@@ -1611,8 +1924,14 @@ class PromptBuilderMixin:
                 )
             if tui_lines:
                 tui_xml = "  <recent_tui_events>\n" + "\n".join(tui_lines) + "\n  </recent_tui_events>"
-                xml_parts.append(tui_xml)
-                token_stats["tui_events"] = TokenCounter.estimate_tokens(tui_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="tui_events",
+                    section_xml=tui_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
 
         tui_verification_targets = state.get("tui_verification_targets", []) or []
         last_tui_verification = dict(state.get("last_tui_verification", {}) or {})
@@ -1648,8 +1967,14 @@ class PromptBuilderMixin:
             )
             verification_lines.append("  </tui_verification>")
             verification_xml = "\n".join(verification_lines)
-            xml_parts.append(verification_xml)
-            token_stats["tui_verification"] = TokenCounter.estimate_tokens(verification_xml)
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="tui_verification",
+                section_xml=verification_xml,
+                budget=context_slice_budget,
+                required=False,
+            )
 
         command_verification_targets = state.get("command_verification_targets", []) or []
         last_command_verification = dict(state.get("last_command_verification", {}) or {})
@@ -1700,8 +2025,14 @@ class PromptBuilderMixin:
             )
             command_lines.append("  </command_verification>")
             command_xml = "\n".join(command_lines)
-            xml_parts.append(command_xml)
-            token_stats["command_verification"] = TokenCounter.estimate_tokens(command_xml)
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="command_verification",
+                section_xml=command_xml,
+                budget=context_slice_budget,
+                required=False,
+            )
 
         convergence_xml = (
             "  <convergence_stats "
@@ -1738,8 +2069,14 @@ class PromptBuilderMixin:
                 mode_lines.append("    </next_step_requirements>")
             mode_lines.append("  </convergence_mode>")
             convergence_mode_xml = "\n".join(mode_lines)
-            xml_parts.append(convergence_mode_xml)
-            token_stats["convergence_mode"] = TokenCounter.estimate_tokens(convergence_mode_xml)
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="convergence_mode",
+                section_xml=convergence_mode_xml,
+                budget=context_slice_budget,
+                required=False,
+            )
 
         command_executions = state.get("command_executions", []) or []
         if command_executions:
@@ -1770,8 +2107,14 @@ class PromptBuilderMixin:
                 )
             if command_lines:
                 command_xml = "  <command_executions>\n" + "\n".join(command_lines) + "\n  </command_executions>"
-                xml_parts.append(command_xml)
-                token_stats["command_executions"] = TokenCounter.estimate_tokens(command_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="command_executions",
+                    section_xml=command_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
 
         tool_artifacts = state.get("tool_artifacts", []) or []
         if tool_artifacts:
@@ -1795,8 +2138,30 @@ class PromptBuilderMixin:
                 )
             if artifact_lines:
                 artifact_xml = "  <tool_artifacts_index>\n" + "\n".join(artifact_lines) + "\n  </tool_artifacts_index>"
-                xml_parts.append(artifact_xml)
-                token_stats["tool_artifacts_index"] = TokenCounter.estimate_tokens(artifact_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="tool_artifacts_index",
+                    section_xml=artifact_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
+
+        hydrated_outputs_xml = self._build_hydrated_tool_outputs_xml(
+            state=state,
+            current_focus=current_focus,
+            current_task=str(current_task or ""),
+            overall_goal=str(overall_goal or ""),
+        )
+        if hydrated_outputs_xml:
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="hydrated_tool_outputs",
+                section_xml=hydrated_outputs_xml,
+                budget=context_slice_budget,
+                required=False,
+            )
 
         summary_events = state.get("summary_events", []) or []
         if summary_events:
@@ -1815,8 +2180,14 @@ class PromptBuilderMixin:
                 )
             if event_lines:
                 summary_events_xml = "  <summary_events>\n" + "\n".join(event_lines) + "\n  </summary_events>"
-                xml_parts.append(summary_events_xml)
-                token_stats["summary_events"] = TokenCounter.estimate_tokens(summary_events_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="summary_events",
+                    section_xml=summary_events_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
 
             checkpoint_lines = []
             for item in summary_events:
@@ -1843,13 +2214,19 @@ class PromptBuilderMixin:
                 )
             if checkpoint_lines:
                 checkpoint_xml = "  <step_checkpoints>\n" + "\n".join(checkpoint_lines[-8:]) + "\n  </step_checkpoints>"
-                xml_parts.append(checkpoint_xml)
-                token_stats["step_checkpoints"] = TokenCounter.estimate_tokens(checkpoint_xml)
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="step_checkpoints",
+                    section_xml=checkpoint_xml,
+                    budget=context_slice_budget,
+                    required=False,
+                )
         
         # (,;)
         context_summary = state.get("context_summary", "")
         previous_history_has_file_views = bool(getattr(self, "_history_has_file_views", False))
-        self._history_has_file_views = bool(file_views_xml)
+        self._history_has_file_views = bool(int(token_stats.get("file_views", 0) or 0) > 0)
         try:
             if include_history:
                 history_msgs = state.get("messages", []) or []
@@ -1879,8 +2256,14 @@ class PromptBuilderMixin:
                             archived_block = f"""  <archived_history compression="heavy">
 {archived_xml}
   </archived_history>"""
-                            xml_parts.append(archived_block)
-                            token_stats["archived_history"] = TokenCounter.estimate_tokens(archived_block)
+                            self._append_context_section(
+                                xml_parts=xml_parts,
+                                token_stats=token_stats,
+                                section_name="archived_history",
+                                section_xml=archived_block,
+                                budget=context_slice_budget,
+                                required=False,
+                            )
 
                     if recent_msgs:
                         recent_xml = self._format_conversation_history_xml(
@@ -1892,8 +2275,14 @@ class PromptBuilderMixin:
                             full_history_xml = f"""  <recent_history compression="light">
 {recent_xml}
   </recent_history>"""
-                            xml_parts.append(full_history_xml)
-                            token_stats["recent_history"] = TokenCounter.estimate_tokens(full_history_xml)
+                            self._append_context_section(
+                                xml_parts=xml_parts,
+                                token_stats=token_stats,
+                                section_name="recent_history",
+                                section_xml=full_history_xml,
+                                budget=context_slice_budget,
+                                required=False,
+                            )
         finally:
             self._history_has_file_views = previous_history_has_file_views
 
@@ -1903,8 +2292,14 @@ class PromptBuilderMixin:
             doc_xml = f"""  <document_content>
     {escaped_context}
   </document_content>"""
-            xml_parts.append(doc_xml)
-            token_stats["document_content"] = TokenCounter.estimate_tokens(doc_xml)
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="document_content",
+                section_xml=doc_xml,
+                budget=context_slice_budget,
+                required=False,
+            )
 
         #  skills  SKILL.md 
         skill_preload_warnings = [
@@ -1929,8 +2324,49 @@ class PromptBuilderMixin:
             skill_xml = f"""  <skill_context>
     {escaped_skill_context}
   </skill_context>"""
-            xml_parts.append(skill_xml)
-            token_stats["skill_context"] = TokenCounter.estimate_tokens(skill_xml)
+            self._append_context_section(
+                xml_parts=xml_parts,
+                token_stats=token_stats,
+                section_name="skill_context",
+                section_xml=skill_xml,
+                budget=context_slice_budget,
+                required=False,
+            )
+
+        skipped_slices = context_slice_budget.get("skipped", []) if isinstance(context_slice_budget, dict) else []
+        if skipped_slices:
+            skipped_lines = []
+            for item in skipped_slices[:20]:
+                if not isinstance(item, dict):
+                    continue
+                section_name = str(item.get("section", "") or "").strip()
+                reason = str(item.get("reason", "") or "").strip()
+                tokens = int(item.get("tokens", 0) or 0)
+                if not section_name:
+                    continue
+                skipped_lines.append(
+                    f'    <skipped section="{self._escape_xml(section_name)}" reason="{self._escape_xml(reason)}" tokens="{tokens}" />'
+                )
+            if skipped_lines:
+                budget_xml = (
+                    "  <context_slice_budget "
+                    f'max_segments="{int(context_slice_budget.get("max_segments", 0) or 0)}" '
+                    f'max_segment_tokens="{int(context_slice_budget.get("max_segment_tokens", 0) or 0)}" '
+                    f'max_total_optional_tokens="{int(context_slice_budget.get("max_total_tokens", 0) or 0)}" '
+                    f'used_segments="{int(context_slice_budget.get("used_segments", 0) or 0)}" '
+                    f'used_optional_tokens="{int(context_slice_budget.get("used_tokens", 0) or 0)}">'
+                    "\n"
+                    + "\n".join(skipped_lines)
+                    + "\n  </context_slice_budget>"
+                )
+                self._append_context_section(
+                    xml_parts=xml_parts,
+                    token_stats=token_stats,
+                    section_name="context_slice_budget",
+                    section_xml=budget_xml,
+                    budget=None,
+                    required=True,
+                )
         
         xml_parts.append("</context>")
         context_xml = "\n".join(xml_parts)
@@ -1963,7 +2399,7 @@ class PromptBuilderMixin:
             
             # :
             if usage_pct > 80:
-                self._emit("warning", "⚠️ : 80%,")
+                self._emit("warning", "鈿狅笍 : 80%,")
         
         return context_xml
     
@@ -1997,6 +2433,36 @@ class PromptBuilderMixin:
         if not match:
             return ""
         return str(match.group(1) or "").strip()
+
+    @staticmethod
+    def _extract_tool_result_attr(text: str, attr_name: str) -> str:
+        attr = str(attr_name or "").strip()
+        if not attr:
+            return ""
+        pattern = rf'<tool_result\b[^>]*\b{re.escape(attr)}="([^"]+)"'
+        match = re.search(pattern, str(text or ""), re.IGNORECASE)
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip()
+
+    def _extract_tool_result_call_id(self, text: str) -> str:
+        return self._extract_tool_result_attr(text, "call_id")
+
+    def _ensure_tool_result_call_id(self, text: str, call_id: str) -> str:
+        payload = str(text or "")
+        call_id_text = str(call_id or "").strip()
+        if not payload or not call_id_text:
+            return payload
+        if self._extract_tool_result_call_id(payload):
+            return payload
+        escaped_id = self._escape_xml(call_id_text)
+        return re.sub(
+            r"(<tool_result\b)([^>]*?)>",
+            rf'\1\2 call_id="{escaped_id}">',
+            payload,
+            count=1,
+            flags=re.IGNORECASE,
+        )
 
     def _should_preserve_tool_result_in_history(self, *, tool_name: str, content: str, compression: str) -> bool:
         _ = (tool_name, content, compression)
@@ -2150,3 +2616,5 @@ class PromptBuilderMixin:
         """ Agent ()."""
         registry = getattr(self, "skill_registry", {}) or {}
         return sorted(registry.keys())
+
+

@@ -1,5 +1,5 @@
 from .graph import create_agent
-from .agents import KlynxAgent
+from .agents import KlynxAgent, KlynxGeneralAgent, RequestOrchestratorAgent, RequestAgent, ReqAgent
 from .builder import create_builder, KlynxGraphBuilder, ComposableAgentRuntime
 from .backend import AgentBackend, LocalAgentBackend
 from .hooks import AgentHook, AgentHookContext
@@ -11,6 +11,10 @@ __all__ = [
     "create_agent",
     "create_builder",
     "KlynxAgent",
+    "KlynxGeneralAgent",
+    "RequestOrchestratorAgent",
+    "RequestAgent",
+    "ReqAgent",
     "KlynxGraphBuilder",
     "ComposableAgentRuntime",
     "AgentBackend",

@@ -136,8 +136,6 @@ class ToolDispatchMixin:
         }
     )
     PYTHON_ONE_SHOT_FLAGS = frozenset({"-h", "--help", "-V", "--version"})
-    TOOL_ARTIFACT_PAGE_DEFAULT = 2000
-    TOOL_ARTIFACT_PAGE_MAX = 8000
     TOOL_ARTIFACT_KEEP_MAX = 300
     TOOL_DEDUPE_WINDOW_DEFAULT = 3
     TOOL_DEDUPE_KEEP_MAX = 400
@@ -145,6 +143,9 @@ class ToolDispatchMixin:
     SOFT_REPEATED_READ_THRESHOLD = 3
     SOFT_READS_PER_PATH_THRESHOLD = 5
     TOOL_RESULT_EXTERNALIZE_EXCLUDED = {"read_file"}
+    TOOL_LEDGER_KEEP_MAX = 80
+    TOOL_REUSE_CACHE_KEEP_MAX = 120
+    TOOL_REUSE_PREVIEW_LIMIT = 800
     FULL_INLINE_PRIMARY_TOOLS = frozenset({"execute_command", "read_file"})
     TOOL_OUTPUT_DELIVERY_DEFAULT = "full_inline"
     TOOL_OUTPUT_HARD_CEILING_DEFAULT = 200000
@@ -544,7 +545,6 @@ class ToolDispatchMixin:
         if not isinstance(active_tools, dict) or not active_tools:
             return True
         return normalized in active_tools
-
     def _expand_parallel_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         expanded: List[Dict[str, Any]] = []
         expanded_count = 0
@@ -558,7 +558,11 @@ class ToolDispatchMixin:
                 params = {}
 
             if tool_name != "parallel_tool_call":
-                expanded.append({"tool": tool_name, "params": params})
+                call_id = str(item.get("call_id", "") or item.get("id", "") or item.get("tool_call_id", "")).strip()
+                payload = {"tool": tool_name, "params": params}
+                if call_id:
+                    payload["call_id"] = call_id
+                expanded.append(payload)
                 continue
 
             calls = params.get("calls", [])
@@ -575,7 +579,11 @@ class ToolDispatchMixin:
                 nested_params = nested.get("params", {})
                 if not isinstance(nested_params, dict):
                     nested_params = {}
-                expanded.append({"tool": nested_tool, "params": nested_params})
+                nested_call_id = str(nested.get("call_id", "") or nested.get("id", "") or nested.get("tool_call_id", "")).strip()
+                nested_payload = {"tool": nested_tool, "params": nested_params}
+                if nested_call_id:
+                    nested_payload["call_id"] = nested_call_id
+                expanded.append(nested_payload)
                 expanded_count += 1
 
         if expanded_count > 0:
@@ -896,6 +904,36 @@ class ToolDispatchMixin:
         if self._extract_tui_selected_labels(lines) or self._text_contains_any_token(text_blob, self.TUI_MENU_KEYWORDS):
             return "menu"
         return "unknown"
+
+    def _default_tui_verification_targets(self) -> List[Dict[str, str]]:
+        ordered_goals = [
+            "selection_navigation",
+            "maze_enter_game",
+            "maze_key_response",
+            "maze_readability",
+        ]
+        targets: List[Dict[str, str]] = []
+        for goal in ordered_goals:
+            template = dict(self.TUI_VERIFICATION_TEMPLATES.get(goal, {}) or {})
+            if not template:
+                continue
+            targets.append(
+                {
+                    "goal": goal,
+                    "assertion": str(template.get("assertion", "") or ""),
+                    "pass_condition": str(template.get("pass_condition", "") or ""),
+                }
+            )
+        return targets
+
+    def _ensure_tui_verification_targets(
+        self,
+        tui_verification_targets: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        existing = [item for item in (tui_verification_targets or []) if isinstance(item, dict)]
+        if existing:
+            return existing
+        return self._default_tui_verification_targets()
 
     def _infer_tui_verification_goal(
         self,
@@ -2535,6 +2573,8 @@ class ToolDispatchMixin:
         summary_events = list(state.get("summary_events", []) or [])
         command_executions = list(state.get("command_executions", []) or [])
         tool_call_history = list(state.get("tool_call_history", []) or [])
+        tool_ledger_recent = list(state.get("tool_ledger_recent", []) or [])
+        tool_reuse_cache = dict(state.get("tool_reuse_cache", {}) or {})
         read_coverage = dict(state.get("read_coverage", {}) or {})
         file_views = dict(state.get("file_views", {}) or {})
         active_file_view_paths = list(state.get("active_file_view_paths", []) or [])
@@ -2677,8 +2717,11 @@ class ToolDispatchMixin:
         for i, tool_call in enumerate(tool_calls, 1):
             tool_name = tool_call.get('tool', 'unknown')
             params = tool_call.get('params', {})
+            call_id = self._resolve_tool_call_id(tool_call, tool_name, i)
             command_op_id = ""
             command_target_op_id = ""
+            reused_result = False
+            reused_cache_entry: Dict[str, Any] = {}
             
             # 
             self._emit("tool_exec", f"[ {i}/{len(tool_calls)}] {tool_name}")
@@ -2718,19 +2761,48 @@ class ToolDispatchMixin:
                 )
                 if dedupe_blocked:
                     round_dedupe_hits += 1
+                    reused_cache_entry = dict(tool_reuse_cache.get(fingerprint, {}) or {})
                 if not self._is_tool_active(tool_name):
                     output = f"<error>Tool not active in current group set: {tool_name}</error>"
                     self._emit("warning", f"[Tool Policy] blocked inactive tool: {tool_name}")
+                    inactive_metadata = {"status": "error", "blocked_reason": "inactive_tool", "call_id": call_id}
+                    result_content = self._build_tool_result_message(
+                        tool_name=tool_name,
+                        params=params if isinstance(params, dict) else {},
+                        output=output,
+                        tool_artifacts=tool_artifacts,
+                        thread_id=thread_id,
+                        metadata=inactive_metadata,
+                        artifact_metrics=round_artifact_metrics,
+                        call_id=call_id,
+                        reused=False,
+                    )
+                    results.append(HumanMessage(content=result_content))
+                    tool_ledger_recent = self._append_tool_ledger_recent(
+                        tool_ledger_recent,
+                        {
+                            "call_id": call_id,
+                            "tool": tool_name,
+                            "fingerprint": fingerprint,
+                            "status": "error",
+                            "reused": False,
+                            "artifact_id": str(inactive_metadata.get("artifact_id", "") or "").strip(),
+                            "summary": output,
+                        },
+                    )
                     executed_tools.append({
                         "tool": tool_name,
                         "params": params,
+                        "call_id": call_id,
                         "success": False,
+                        "status_label": "inactive",
+                        "error": "inactive_tool",
+                        "parallel_mode": self._tool_parallel_safety(tool_name, params if isinstance(params, dict) else {}),
+                        "deduped": bool(dedupe_blocked),
+                        "reused": False,
                         "timestamp": int(time.time()),
                     })
                     progress_lines.append(self._format_progress_entry(tool_name, params, "ERROR"))
-                    tool_results_xml.append(
-                        f'<tool_result tool="{tool_name}" success="false">{output}</tool_result>'
-                    )
                     continue
 
                 # ====== Unified state update ======
@@ -2861,34 +2933,39 @@ class ToolDispatchMixin:
                     )
                     if subtask_entry:
                         subtask_history.append(subtask_entry)
-
                 # ======  ======
                 else:
-                    prefetched = prefetched_parallel_outputs.get(i - 1)
-                    if prefetched is not None:
-                        if str(prefetched.get("error", "") or "").strip():
-                            raise RuntimeError(str(prefetched.get("error", "") or "").strip())
-                        output = prefetched.get("output", "")
-                        parallel_executed_count += 1
+                    if dedupe_blocked and reused_cache_entry:
+                        output = self._build_reused_tool_output(reused_cache_entry, tool_name)
+                        reused_result = True
                     else:
-                        if tool_name == "run_in_terminal":
-                            command_op_id = f"cmd_{uuid.uuid4().hex[:10]}"
-                        elif tool_name in {"read_terminal", "read_terminal_since_last", "wait_terminal_until"}:
-                            target_entry = self._find_command_entry(
-                                command_executions,
-                                op_id=str(params.get("op_id", "") or "").strip(),
-                                terminal_name=str(params.get("name", "") or "").strip(),
-                                statuses=("pending", "running"),
+                        prefetched = prefetched_parallel_outputs.get(i - 1)
+                        if prefetched is not None:
+                            if str(prefetched.get("error", "") or "").strip():
+                                raise RuntimeError(str(prefetched.get("error", "") or "").strip())
+                            output = prefetched.get("output", "")
+                            parallel_executed_count += 1
+                        else:
+                            if tool_name == "run_in_terminal":
+                                command_op_id = f"cmd_{uuid.uuid4().hex[:10]}"
+                            elif tool_name in {"read_terminal", "read_terminal_since_last", "wait_terminal_until"}:
+                                target_entry = self._find_command_entry(
+                                    command_executions,
+                                    op_id=str(params.get("op_id", "") or "").strip(),
+                                    terminal_name=str(params.get("name", "") or "").strip(),
+                                    statuses=("pending", "running"),
+                                )
+                                command_target_op_id = str(target_entry.get("op_id", "") or "").strip()
+                            output, loaded_skill_names, skill_context = self._execute_single_tool_action(
+                                tool_name=tool_name,
+                                params=params,
+                                loaded_skill_names=loaded_skill_names,
+                                skill_context=skill_context,
+                                command_op_id=command_op_id,
+                                command_target_op_id=command_target_op_id,
+                                tool_artifacts=tool_artifacts,
+                                thread_id=thread_id,
                             )
-                            command_target_op_id = str(target_entry.get("op_id", "") or "").strip()
-                        output, loaded_skill_names, skill_context = self._execute_single_tool_action(
-                            tool_name=tool_name,
-                            params=params,
-                            loaded_skill_names=loaded_skill_names,
-                            skill_context=skill_context,
-                            command_op_id=command_op_id,
-                            command_target_op_id=command_target_op_id,
-                        )
                 
                 #  Actionable Hint()
                 if "<error>" in output:
@@ -3091,6 +3168,8 @@ class ToolDispatchMixin:
                     pending_verification_targets=pending_verification_targets,
                     mutation_record=mutation_record,
                 )
+                if self._is_tui_tool(tool_name) or tool_name == "activate_tui_mode":
+                    tui_verification_targets = self._ensure_tui_verification_targets(tui_verification_targets)
                 tui_verification_record = self._build_tui_verification_record(
                     state=state,
                     tool_name=tool_name,
@@ -3209,6 +3288,9 @@ class ToolDispatchMixin:
                     command_verification_record=command_verification_record,
                     output=str(output or ""),
                 )
+                tool_result_metadata["call_id"] = call_id
+                if reused_result:
+                    tool_result_metadata["reused"] = "true"
                 result_content = self._build_tool_result_message(
                     tool_name=tool_name,
                     params=params,
@@ -3217,17 +3299,45 @@ class ToolDispatchMixin:
                     thread_id=thread_id,
                     metadata=tool_result_metadata,
                     artifact_metrics=round_artifact_metrics,
+                    call_id=call_id,
+                    reused=reused_result,
                 )
                 results.append(HumanMessage(content=result_content))
-                
+
+                artifact_id = str(tool_result_metadata.get("artifact_id", "") or "").strip()
+                output_text = str(output or "")
+                tool_ledger_recent = self._append_tool_ledger_recent(
+                    tool_ledger_recent,
+                    {
+                        "call_id": call_id,
+                        "tool": tool_name,
+                        "fingerprint": fingerprint,
+                        "status": str(tool_result_metadata.get("status", "") or ""),
+                        "reused": reused_result,
+                        "artifact_id": artifact_id,
+                        "summary": output_text,
+                    },
+                )
+                if str(tool_result_metadata.get("status", "") or "").strip().lower() == "success":
+                    tool_reuse_cache[str(fingerprint or "")] = {
+                        "timestamp": int(time.time()),
+                        "tool": tool_name,
+                        "status": str(tool_result_metadata.get("status", "") or ""),
+                        "preview": self._shorten_tool_result_preview(output_text, self.TOOL_REUSE_PREVIEW_LIMIT),
+                        "artifact_id": artifact_id,
+                    }
+                    tool_reuse_cache = self._prune_tool_reuse_cache(tool_reuse_cache)
+
                 # 
                 executed_tools.append({
                     "tool": tool_name,
                     "params": params,
+                    "call_id": call_id,
                     "success": True,
                     "status_label": "",
                     "parallel_mode": self._tool_parallel_safety(tool_name, params if isinstance(params, dict) else {}),
                     "deduped": bool(dedupe_blocked),
+                    "reused": bool(reused_result),
                     "tui_progress_reason": tui_progress_reason,
                     "mutation_status": str(mutation_record.get("status", "") or ""),
                     "mutation_file_changed": bool(mutation_record.get("file_changed", False)),
@@ -3279,31 +3389,50 @@ class ToolDispatchMixin:
                     mutation_record=mutation_record,
                 )
 
+                error_metadata = self._build_tool_result_metadata(
+                    tool_name=tool_name,
+                    mutation_record=mutation_record,
+                    tui_verification_record={},
+                    command_verification_record={},
+                    output=error_output,
+                )
+                error_metadata["call_id"] = call_id
                 result_content = self._build_tool_result_message(
                     tool_name=tool_name,
                     params=params if isinstance(params, dict) else {},
                     output=error_output,
                     tool_artifacts=tool_artifacts,
                     thread_id=thread_id,
-                    metadata=self._build_tool_result_metadata(
-                        tool_name=tool_name,
-                        mutation_record=mutation_record,
-                        tui_verification_record={},
-                        command_verification_record={},
-                        output=error_output,
-                    ),
+                    metadata=error_metadata,
                     artifact_metrics=round_artifact_metrics,
+                    call_id=call_id,
+                    reused=False,
                 )
                 results.append(HumanMessage(content=result_content))
-                
+
+                tool_ledger_recent = self._append_tool_ledger_recent(
+                    tool_ledger_recent,
+                    {
+                        "call_id": call_id,
+                        "tool": tool_name,
+                        "fingerprint": fingerprint,
+                        "status": "error",
+                        "reused": False,
+                        "artifact_id": "",
+                        "summary": error_output,
+                    },
+                )
+
                 executed_tools.append({
                     "tool": tool_name,
                     "params": params,
+                    "call_id": call_id,
                     "success": False,
                     "status_label": "",
                     "error": str(e),
                     "parallel_mode": self._tool_parallel_safety(tool_name, params if isinstance(params, dict) else {}),
                     "deduped": False,
+                    "reused": False,
                     "mutation_status": str(mutation_record.get("status", "") or ""),
                     "mutation_file_changed": bool(mutation_record.get("file_changed", False)),
                 })
@@ -3461,6 +3590,8 @@ class ToolDispatchMixin:
             "tool_artifacts": tool_artifacts,
             "subtask_history": subtask_history[-100:],
             "tool_call_history": tool_call_history[-self.TOOL_DEDUPE_KEEP_MAX :],
+            "tool_ledger_recent": tool_ledger_recent[-self.TOOL_LEDGER_KEEP_MAX :],
+            "tool_reuse_cache": self._prune_tool_reuse_cache(tool_reuse_cache),
             "parallel_executed_count": int(parallel_executed_count),
             "artifact_saved_count_round": self._coerce_artifact_metric_int(
                 round_artifact_metrics.get("saved_count", 0)
@@ -3621,6 +3752,16 @@ class ToolDispatchMixin:
         except Exception:
             raw = self.TOOL_OUTPUT_HARD_CEILING_DEFAULT
         return max(4000, raw)
+    @staticmethod
+    def _shorten_tool_result_preview(text: str, limit: int) -> str:
+        payload = str(text or "").strip()
+        if not payload:
+            return ""
+        capped = max(int(limit or 0), 80)
+        if len(payload) <= capped:
+            return payload
+        omitted = len(payload) - capped
+        return f"{payload[:capped]}\n...[truncated {omitted} chars]"
 
     def _build_tool_result_message(
         self,
@@ -3631,28 +3772,83 @@ class ToolDispatchMixin:
         thread_id: str,
         metadata: Any = None,
         artifact_metrics: Any = None,
+        call_id: str = "",
+        reused: bool = False,
     ) -> str:
-        output_text = str(output)
-        _ = (params, tool_artifacts, thread_id, artifact_metrics)
-        metadata = dict(metadata or {})
+        output_text = str(output or "")
+        metadata_ref: Dict[str, Any] = metadata if isinstance(metadata, dict) else {}
+        metadata = dict(metadata_ref)
         if "status" not in metadata:
             metadata["status"] = "error" if "<error>" in output_text.lower() else "success"
+        if call_id:
+            metadata["call_id"] = call_id
+        if reused:
+            metadata["reused"] = "true"
+
+        mode = self._resolve_tool_output_delivery_mode()
+        should_externalize = self._should_externalize_tool_output(tool_name, output_text)
+        artifact: Dict[str, Any] = {}
+        inline_output = output_text
+
+        if should_externalize:
+            artifact = self._store_tool_artifact(
+                tool_artifacts=tool_artifacts,
+                tool_name=tool_name,
+                params=params if isinstance(params, dict) else {},
+                output_text=output_text,
+                thread_id=thread_id,
+            )
+            self._accumulate_artifact_metrics(artifact_metrics, artifact)
+            artifact_id = str(artifact.get("id", "") or "").strip()
+            store_key = str(artifact.get("content_store_key", "") or "").strip()
+            if artifact_id:
+                metadata["artifact_id"] = artifact_id
+            if store_key:
+                metadata["content_store_key"] = store_key
+            metadata["delivery_mode"] = mode
+            metadata["content_truncated"] = "true"
+            metadata["total_chars"] = str(len(output_text))
+            metadata["total_lines"] = str(max(len(output_text.splitlines()), 1))
+            preview_limit = self.TOOL_RESULT_PREVIEW_LIMIT
+            if mode == "artifact_first":
+                preview_limit = max(400, min(self.TOOL_RESULT_PREVIEW_LIMIT, 800))
+            preview_head = self._shorten_tool_result_preview(output_text, preview_limit)
+            preview_tail = self._shorten_tool_result_preview(output_text[-preview_limit:], preview_limit)
+            receipt_lines = [
+                "[tool_output_truncated]",
+                f"total_lines={metadata['total_lines']} total_chars={metadata['total_chars']}",
+            ]
+            if preview_head:
+                receipt_lines.extend(["<head>", preview_head, "</head>"])
+            if preview_tail and preview_tail != preview_head:
+                receipt_lines.extend(["<tail>", preview_tail, "</tail>"])
+            if artifact_id:
+                receipt_lines.append(f"[artifact_ref] id={artifact_id}")
+            receipt_lines.append(
+                "[system] Full output is stored internally. Relevant slices will be auto-hydrated into context when needed."
+            )
+            receipt_lines.append(
+                "[system] If evidence is still insufficient, rerun the tool with narrower scope to fetch targeted output."
+            )
+            inline_output = "\n".join(receipt_lines)
+
         attr_parts = []
         for key, value in metadata.items():
             key_text = str(key or "").strip()
             value_text = str(value or "").strip()
             if key_text and value_text:
                 attr_parts.append(f'{key_text}="{self._escape_tool_result_xml(value_text)}"')
-        inline_output = output_text
         attrs = " ".join(attr_parts)
         if attrs:
             attrs = " " + attrs
+        if isinstance(metadata_ref, dict):
+            metadata_ref.clear()
+            metadata_ref.update(metadata)
         return (
             f"<tool_result tool=\"{self._escape_tool_result_xml(tool_name)}\"{attrs}>\n"
             f"{inline_output}\n"
             f"</tool_result>"
         )
-
 
     def _store_tool_artifact(
         self,
@@ -3720,11 +3916,28 @@ class ToolDispatchMixin:
             artifact_metrics.get("cleanup_count", 0)
         ) + self._coerce_artifact_metric_int(artifact.get("cleanup_count", 0))
 
-
     def _should_externalize_tool_output(self, tool_name: str, output_text: str) -> bool:
-        _ = (tool_name, output_text)
-        return False
+        text = str(output_text or "")
+        if not text:
+            return False
+        normalized_tool = str(tool_name or "").strip()
+        hard_ceiling = self._resolve_tool_output_hard_ceiling()
+        if len(text) > hard_ceiling:
+            return True
+        if normalized_tool in self.TOOL_RESULT_EXTERNALIZE_EXCLUDED:
+            return False
 
+        mode = self._resolve_tool_output_delivery_mode()
+        if "<error>" in text.lower() and len(text) <= self.TOOL_RESULT_INLINE_LIMIT:
+            return False
+        if mode == "artifact_first":
+            return True
+        if mode == "hybrid":
+            inline_limit = self.TOOL_RESULT_INLINE_LIMIT
+            if normalized_tool not in self.FULL_INLINE_PRIMARY_TOOLS:
+                inline_limit = min(inline_limit, self.TOOL_RESULT_PREVIEW_LIMIT)
+            return len(text) > inline_limit
+        return False
 
     def _normalize_tool_params(self, params: Dict[str, Any]) -> str:
         try:
@@ -3742,6 +3955,65 @@ class ToolDispatchMixin:
         digest = hashlib.sha256(f"{tool_name}:{normalized}".encode("utf-8")).hexdigest()[:16]
         return f"{tool_name}:{digest}"
 
+
+    def _resolve_tool_call_id(self, tool_call: Dict[str, Any], tool_name: str, index: int) -> str:
+        payload = dict(tool_call or {}) if isinstance(tool_call, dict) else {}
+        for key in ("call_id", "id", "tool_call_id"):
+            value = str(payload.get(key, "") or "").strip()
+            if value:
+                return value
+            fn = payload.get("function", {}) if isinstance(payload.get("function"), dict) else {}
+            nested_value = str(fn.get(key, "") or "").strip()
+            if nested_value:
+                return nested_value
+        return f"call_{int(index or 0)}_{str(tool_name or '').strip() or 'tool'}"
+
+    def _append_tool_ledger_recent(
+        self,
+        tool_ledger_recent: List[Dict[str, Any]],
+        entry: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(entry, dict):
+            return tool_ledger_recent
+        record = {
+            "timestamp": int(time.time()),
+            "call_id": str(entry.get("call_id", "") or "").strip(),
+            "tool": str(entry.get("tool", "") or "").strip(),
+            "fingerprint": str(entry.get("fingerprint", "") or "").strip(),
+            "status": str(entry.get("status", "") or "").strip(),
+            "reused": bool(entry.get("reused", False)),
+            "artifact_id": str(entry.get("artifact_id", "") or "").strip(),
+            "summary": self._shorten_tool_result_preview(str(entry.get("summary", "") or ""), 220),
+        }
+        tool_ledger_recent.append(record)
+        if len(tool_ledger_recent) > self.TOOL_LEDGER_KEEP_MAX:
+            del tool_ledger_recent[:-self.TOOL_LEDGER_KEEP_MAX]
+        return tool_ledger_recent
+
+    def _prune_tool_reuse_cache(self, tool_reuse_cache: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        if not isinstance(tool_reuse_cache, dict):
+            return {}
+        if len(tool_reuse_cache) <= self.TOOL_REUSE_CACHE_KEEP_MAX:
+            return tool_reuse_cache
+        ordered = sorted(
+            tool_reuse_cache.items(),
+            key=lambda item: int((item[1] or {}).get("timestamp", 0) or 0),
+            reverse=True,
+        )[: self.TOOL_REUSE_CACHE_KEEP_MAX]
+        return {str(key): dict(value or {}) for key, value in ordered}
+
+    def _build_reused_tool_output(self, cache_entry: Dict[str, Any], tool_name: str) -> str:
+        artifact_id = str(cache_entry.get("artifact_id", "") or "").strip()
+        preview = self._shorten_tool_result_preview(
+            str(cache_entry.get("preview", "") or ""),
+            self.TOOL_REUSE_PREVIEW_LIMIT,
+        )
+        lines = [f"<info>reused_recent_result tool={tool_name}</info>"]
+        if artifact_id:
+            lines.append(f"<info>artifact_id={artifact_id}</info>")
+        if preview:
+            lines.append(preview)
+        return "\n".join(lines)
 
     def _append_tool_call_history(
         self,
@@ -4941,8 +5213,6 @@ class ToolDispatchMixin:
         last_diff = dict(event) if tool_name in {"read_tui_diff", "send_keys", "send_keys_and_read"} else {}
         last_region = dict(event) if tool_name == "read_tui_region" else {}
         return events, focus, last_diff, last_region
-
-
     def _execute_single_tool_action(
         self,
         tool_name: str,
@@ -4951,6 +5221,8 @@ class ToolDispatchMixin:
         skill_context: str,
         command_op_id: str = "",
         command_target_op_id: str = "",
+        tool_artifacts: Any = None,
+        thread_id: str = "",
     ) -> Tuple[str, List[str], str]:
         normalized_tool_name = str(tool_name or "").strip()
         if not self._is_tool_active(normalized_tool_name):
@@ -4960,12 +5232,12 @@ class ToolDispatchMixin:
                 skill_context,
             )
         tool_name = normalized_tool_name
-
         if tool_name == "load_skill":
             skill_name = (
                 str(params.get("name", "") or params.get("skill_name", "") or params.get("input", ""))
                 .strip()
             )
+            full_requested = self._coerce_bool(params.get("full", False), default=False)
             skill_result = self.get_skill_markdown(skill_name)
             if not skill_result.get("ok", False):
                 return (
@@ -4975,32 +5247,74 @@ class ToolDispatchMixin:
                 )
 
             canonical_name = str(skill_result.get("name", skill_name)).strip()
-            if canonical_name not in loaded_skill_names:
+            if canonical_name and canonical_name not in loaded_skill_names:
                 loaded_skill_names.append(canonical_name)
-                block_builder = getattr(self, "_build_skill_context_block", None)
-                if callable(block_builder):
-                    block = str(block_builder(skill_result, source="tool"))
-                else:
-                    block = (
-                        f"[SKILL] {canonical_name}\n"
-                        f"skill_dir: {skill_result.get('skill_dir', '')}\n"
-                        f"skill_md: {skill_result.get('skill_md_path', '')}\n"
-                        f"description: {skill_result.get('description', '')}\n"
-                        f"----- SKILL.md BEGIN -----\n"
-                        f"{skill_result.get('content', '')}\n"
-                        f"----- SKILL.md END -----"
-                    )
-                skill_context = f"{skill_context}\n\n{block}".strip() if skill_context else block
-                return (
-                    f"<success>: {canonical_name}</success>\n"
-                    f"<info>SKILL.md ,.</info>",
-                    loaded_skill_names,
-                    skill_context,
-                )
 
+            content_text = str(skill_result.get("content", "") or "")
+            content_digest = str(skill_result.get("content_digest", "") or "").strip()
+            include_full = bool(full_requested)
+            artifact_hint = ""
+            context_limit = max(int(getattr(self, "SKILL_CONTEXT_INLINE_CHAR_LIMIT", 6000) or 6000), 1200)
+            if include_full and len(content_text) > context_limit:
+                include_full = False
+                if isinstance(tool_artifacts, list):
+                    artifact = self._store_tool_artifact(
+                        tool_artifacts=tool_artifacts,
+                        tool_name="load_skill",
+                        params={"name": canonical_name, "full": True},
+                        output_text=content_text,
+                        thread_id=thread_id,
+                    )
+                    artifact_id = str(artifact.get("id", "") or "").strip()
+                    if artifact_id:
+                        artifact_hint = f"artifact_id={artifact_id}"
+
+            block_builder = getattr(self, "_build_skill_context_block", None)
+            if callable(block_builder):
+                try:
+                    block = str(block_builder(skill_result, source="tool", include_full=include_full))
+                except TypeError:
+                    block = str(block_builder(skill_result, source="tool"))
+            else:
+                block = (
+                    f"[SKILL] {canonical_name}\n"
+                    f"skill_dir: {skill_result.get('skill_dir', '')}\n"
+                    f"skill_md: {skill_result.get('skill_md_path', '')}\n"
+                    f"description: {skill_result.get('description', '')}"
+                )
+                if include_full:
+                    block = (
+                        f"{block}\n"
+                        "----- SKILL.md BEGIN -----\n"
+                        f"{content_text}\n"
+                        "----- SKILL.md END -----"
+                    )
+
+            append_block = getattr(self, "_append_skill_context_block", None)
+            if callable(append_block):
+                skill_context = append_block(skill_context, block, content_digest)
+            else:
+                if content_digest and f"digest: {content_digest}" in str(skill_context or ""):
+                    pass
+                else:
+                    skill_context = f"{skill_context}\n\n{block}".strip() if skill_context else block
+
+            status = "loaded"
+            if full_requested and include_full:
+                status = "loaded_full"
+            elif full_requested and not include_full:
+                status = "loaded_summary_with_artifact"
+            message_lines = [f"<success>{status}: {canonical_name}</success>"]
+            if full_requested and not include_full:
+                message_lines.append(
+                    "<info>Full SKILL.md moved out of inline context due budget; relevant slices will be auto-hydrated into context when needed.</info>"
+                )
+            else:
+                message_lines.append("<info>Skill summary is now available in <skill_context>.</info>")
+            if artifact_hint:
+                message_lines.append(f"<info>{artifact_hint}</info>")
             return (
-                f"<info>: {canonical_name}</info>\n"
-                f"<info>,.</info>",
+                "\n".join(message_lines),
                 loaded_skill_names,
                 skill_context,
             )
@@ -5012,26 +5326,20 @@ class ToolDispatchMixin:
                 skill_context,
             )
 
-        if tool_name == "execute_command":
-            return self._call_execute_command(params), loaded_skill_names, skill_context
-        if tool_name == "exec_command":
-            return self._call_exec_command(params), loaded_skill_names, skill_context
-        if tool_name == "write_stdin":
-            return self._call_write_stdin(params), loaded_skill_names, skill_context
-        if tool_name == "close_exec_session":
-            return self._call_close_exec_session(params), loaded_skill_names, skill_context
-        if tool_name == "create_terminal":
-            return self.terminal_manager.create_terminal(params.get("name"), params.get("cwd")), loaded_skill_names, skill_context
-        if tool_name == "run_in_terminal":
+        # Dispatch-map first for straightforward tool handlers; special cases stay below.
+        simple_dispatch_map = self._build_simple_tool_dispatch_map(
+            params=params if isinstance(params, dict) else {},
+            command_op_id=command_op_id,
+            command_target_op_id=command_target_op_id,
+        )
+        direct_handler = simple_dispatch_map.get(tool_name)
+        if callable(direct_handler):
             return (
-                self._call_terminal_run_command(
-                    str(params.get("name", "") or ""),
-                    str(params.get("command", "") or ""),
-                    command_op_id,
-                ),
+                str(direct_handler()),
                 loaded_skill_names,
                 skill_context,
             )
+
         if tool_name == "read_terminal":
             session_name = str(params.get("name", "") or "").strip()
             if self._looks_like_exec_session_id(session_name):
@@ -5106,8 +5414,6 @@ class ToolDispatchMixin:
                 loaded_skill_names,
                 skill_context,
             )
-        if tool_name == "check_syntax":
-            return SyntaxChecker.check_file(params.get("path")), loaded_skill_names, skill_context
         if tool_name == "open_tui":
             rows = int(params.get("rows", 30) or 30)
             cols = int(params.get("cols", 100) or 100)
@@ -5214,35 +5520,45 @@ class ToolDispatchMixin:
                 loaded_skill_names,
                 skill_context,
             )
-        if tool_name == "browser_open":
-            return self.browser_manager.goto(params.get("url")), loaded_skill_names, skill_context
-        if tool_name == "browser_view":
-            return self.browser_manager.get_content(params.get("selector")), loaded_skill_names, skill_context
-        if tool_name == "browser_act":
-            return (
-                self.browser_manager.act(
-                    params.get("action"),
-                    params.get("selector"),
-                    params.get("value"),
-                ),
-                loaded_skill_names,
-                skill_context,
-            )
-        if tool_name == "browser_scroll":
-            return (
-                self.browser_manager.scroll(
-                    direction=params.get("direction", "down"),
-                    amount=params.get("amount", None),
-                ),
-                loaded_skill_names,
-                skill_context,
-            )
-        if tool_name == "browser_screenshot":
-            return self.browser_manager.screenshot(), loaded_skill_names, skill_context
-        if tool_name == "browser_console_logs":
-            return self.browser_manager.get_console_logs(), loaded_skill_names, skill_context
-
         return ToolRegistry.execute({"tool": tool_name, "params": params}), loaded_skill_names, skill_context
+
+    def _build_simple_tool_dispatch_map(
+        self,
+        *,
+        params: Dict[str, Any],
+        command_op_id: str,
+        command_target_op_id: str,
+    ) -> Dict[str, Any]:
+        safe_params = params if isinstance(params, dict) else {}
+        return {
+            "execute_command": lambda: self._call_execute_command(safe_params),
+            "exec_command": lambda: self._call_exec_command(safe_params),
+            "write_stdin": lambda: self._call_write_stdin(safe_params),
+            "close_exec_session": lambda: self._call_close_exec_session(safe_params),
+            "create_terminal": lambda: self.terminal_manager.create_terminal(
+                safe_params.get("name"),
+                safe_params.get("cwd"),
+            ),
+            "run_in_terminal": lambda: self._call_terminal_run_command(
+                str(safe_params.get("name", "") or ""),
+                str(safe_params.get("command", "") or ""),
+                command_op_id,
+            ),
+            "check_syntax": lambda: SyntaxChecker.check_file(safe_params.get("path")),
+            "browser_open": lambda: self.browser_manager.goto(safe_params.get("url")),
+            "browser_view": lambda: self.browser_manager.get_content(safe_params.get("selector")),
+            "browser_act": lambda: self.browser_manager.act(
+                safe_params.get("action"),
+                safe_params.get("selector"),
+                safe_params.get("value"),
+            ),
+            "browser_scroll": lambda: self.browser_manager.scroll(
+                direction=safe_params.get("direction", "down"),
+                amount=safe_params.get("amount", None),
+            ),
+            "browser_screenshot": lambda: self.browser_manager.screenshot(),
+            "browser_console_logs": lambda: self.browser_manager.get_console_logs(),
+        }
 
 
     def _execute_subtask_actions(
@@ -5311,6 +5627,8 @@ class ToolDispatchMixin:
                     params=action_params,
                     loaded_skill_names=loaded_skill_names,
                     skill_context=skill_context,
+                    tool_artifacts=tool_artifacts,
+                    thread_id=thread_id,
                 )
                 action_output_text = str(action_output)
                 success = "<error>" not in action_output_text.lower()
@@ -5510,4 +5828,29 @@ class ToolDispatchMixin:
             return f"- [TUI] : {name} [{status}]"
         else:
             return f"-  {tool_name} [{status}]"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

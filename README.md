@@ -28,13 +28,14 @@ Example (OpenAI):
 export OPENAI_API_KEY="sk-..."
 ```
 
-### 2) Create a model and a default agent
+### 2) Create a model and runtime via builder
 
 ```python
-from klynx import create_agent, setup_model
+from klynx import create_builder, setup_model
 
 model = setup_model("gpt-4o")
-agent = create_agent(
+builder = create_builder(name="quickstart").react()
+agent = builder.build(
     working_dir=".",
     model=model,
     max_iterations=20,
@@ -70,18 +71,45 @@ from klynx import (
 
 ## Usage Tutorial
 
-### Tutorial 1: Direct Q&A mode
+### Tutorial 1: Direct Q&A mode (builder.ask preset)
 
 ```python
-from klynx import create_agent, setup_model
+from klynx import create_builder, setup_model
 
-model = setup_model("gpt-4o")
-agent = create_agent(working_dir=".", model=model)
+model = setup_model("gpt-5.3")
+builder = create_builder(name="ask-demo").ask()
+agent = builder.build(working_dir=".", model=model)
 
 for event in agent.ask("Explain the key modules in this codebase", thread_id="ask-demo"):
     if event.get("type") == "done":
         print(event.get("answer", ""))
 ```
+
+### Tutorial 1.5: RequestAgent (`RequestOrchestratorAgent`, builder.request preset)
+
+```python
+from klynx import create_builder, setup_model
+
+model = setup_model("gpt-5.3")
+builder = create_builder(name="request-demo").request(
+    model=model,           # baseline (ask/fallback)
+    fast_model=model,      # small brain
+    thinking_model=model,  # big brain
+    enable_subagent=False,
+)
+agent = builder.build(
+    working_dir=".",
+    max_iterations=24,
+)
+
+for event in agent.invoke(task="列出当前目录并总结关键文件", thread_id="request-demo"):
+    if event.get("type") == "token":
+        print(event.get("content", ""), end="", flush=True)
+    if event.get("type") == "done":
+        print("\ncompleted:", event.get("task_completed", False))
+```
+
+Small brain executes tools; big brain plans/decides per subtask request.
 
 ### Tutorial 2: Build a composable runtime with `create_builder`
 
@@ -91,8 +119,7 @@ from klynx import create_builder, setup_model
 model = setup_model("gpt-4o")
 
 builder = create_builder(name="demo_builder")
-builder.add_node("klynx_loop")
-builder.set_entry_point("klynx_loop")
+builder.react()
 
 runtime = builder.build(
     working_dir=".",
@@ -117,10 +144,9 @@ def post_process(runtime, payload):
     return [{"type": "summary", "content": "Post-processing completed."}]
 
 builder = create_builder(name="pipeline")
-builder.add_node("klynx_loop")
+builder.react()
 builder.add_node("post_process", post_process)
 builder.add_edge("klynx_loop", "post_process")
-builder.set_entry_point("klynx_loop")
 
 runtime = builder.build(working_dir=".", model=model)
 for event in runtime.invoke(task="Refactor this module", thread_id="pipeline-demo"):
@@ -158,7 +184,7 @@ Default loading behavior:
 ### Tutorial 5: Permission modes (`workspace` / `global`)
 
 ```python
-agent = create_agent(working_dir=".", model=model)
+agent = create_builder(name="perm").react().build(working_dir=".", model=model)
 
 # default: workspace sandbox
 print(agent.get_permission())
@@ -184,7 +210,7 @@ If Tavily API key is not configured, `web_search` is removed from tool groups an
 ### Tutorial 7: Skill injection modes
 
 ```python
-agent = create_agent(
+agent = create_builder(name="skills").react().build(
     working_dir=".",
     model=model,
     skill_injection_mode="hybrid",  # preload | tool | hybrid
@@ -201,10 +227,14 @@ You can inspect checkpoint history for a thread and select a rollback target.
 Rollback is one-shot by default: the next `invoke/ask` resumes from the selected checkpoint.
 
 ```python
-from klynx import create_agent, setup_model
+from klynx import create_builder, setup_model
 
 model = setup_model("gpt-4o")
-agent = create_agent(working_dir=".", model=model, load_project_docs=False)
+agent = create_builder(name="rollback").react().build(
+    working_dir=".",
+    model=model,
+    load_project_docs=False,
+)
 
 thread_id = "rollback-demo"
 list(agent.invoke("task A", thread_id=thread_id))

@@ -209,9 +209,7 @@ class ComposableAgentRuntime(ToolboxRuntime):
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
-        agent = self._loop_agent
-        if agent is None:
-            raise AttributeError(name)
+        agent = self._ensure_loop_agent()
         return getattr(agent, name)
 
 
@@ -334,6 +332,62 @@ class KlynxGraphBuilder:
 
     def with_runtime_defaults(self, **kwargs: Any):
         self._runtime_defaults.update(dict(kwargs or {}))
+        return self
+
+    def _ensure_klynx_loop_entry(self) -> None:
+        if "klynx_loop" not in self._nodes:
+            self.add_node("klynx_loop")
+        if not self._entry_point:
+            self._entry_point = "klynx_loop"
+
+    def react(self, **runtime_defaults: Any):
+        """
+        Configure this builder for the default ReAct runtime.
+
+        This is a convenience preset equivalent to:
+        - add_node("klynx_loop")
+        - set entry point to "klynx_loop" (when unset)
+        - runtime default `mode="react"`
+        """
+        self._ensure_klynx_loop_entry()
+        defaults = {"mode": "react"}
+        defaults.update(dict(runtime_defaults or {}))
+        self.with_runtime_defaults(**defaults)
+        return self
+
+    def request(self, **runtime_defaults: Any):
+        """
+        Configure this builder for RequestOrchestrator runtime.
+
+        This is a convenience preset equivalent to:
+        - add_node("klynx_loop")
+        - set entry point to "klynx_loop" (when unset)
+        - runtime default `mode="request_orchestrator"`
+        - if `model` is not provided, fallback to `fast_model` or
+          `thinking_model` as baseline model for ask/fallback paths.
+        """
+        self._ensure_klynx_loop_entry()
+        defaults = {"mode": "request_orchestrator"}
+        defaults.update(dict(runtime_defaults or {}))
+        if defaults.get("model") is None:
+            if defaults.get("fast_model") is not None:
+                defaults["model"] = defaults.get("fast_model")
+            elif defaults.get("thinking_model") is not None:
+                defaults["model"] = defaults.get("thinking_model")
+        self.with_runtime_defaults(**defaults)
+        return self
+
+    def ask(self, **runtime_defaults: Any):
+        """
+        Configure this builder for ask-first usage.
+
+        Ask streaming itself uses runtime.ask(...), but this preset keeps
+        a consistent builder entry setup and defaults to `mode="react"`.
+        """
+        self._ensure_klynx_loop_entry()
+        defaults = {"mode": "react"}
+        defaults.update(dict(runtime_defaults or {}))
+        self.with_runtime_defaults(**defaults)
         return self
 
     def with_tools(self, *tool_specs: Any):

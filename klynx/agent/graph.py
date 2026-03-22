@@ -1,4 +1,4 @@
-"""
+﻿"""
 Klynx Agent - LangGraph StateGraph
  OODA 
 """
@@ -159,6 +159,9 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
 
     SKILL_MARKER_RE = re.compile(r"\$([A-Za-z0-9._-]+)")
     SKILL_PATH_RE = re.compile(r"([A-Za-z]:[^\s\"'<>]*SKILL\.md|[~/\.][^\s\"'<>]*SKILL\.md)", re.IGNORECASE)
+    SKILL_SUMMARY_STEPS_MAX = 8
+    SKILL_SUMMARY_ITEMS_MAX = 6
+    SKILL_CONTEXT_INLINE_CHAR_LIMIT = 6000
 
 
     def __init__(
@@ -1072,7 +1075,6 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
             self.add_skills(specs)
             self._emit("info", f"[Skills]  .klynx/skills  {len(specs)} ")
         return self
-
     def _refresh_skills_prompt(self):
         if not self.skill_registry:
             self._skills_prompt_cache = ""
@@ -1102,36 +1104,6 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
             lines.append(f"- `{name}` ({source}, scope={scope}): {desc}")
 
         self._skills_prompt_cache = "\n".join(lines).strip()
-        return
-        """ skills ."""
-        if not self.skill_registry:
-            self._skills_prompt_cache = ""
-            return
-
-        lines = []
-        lines.append("<skills_registry>")
-        lines.append("  <description> skills . skill , SKILL.md  turn.</description>")
-        lines.append("  <rules>")
-        lines.append("    <rule>,.</rule>")
-        lines.append("    <rule> skill , load_skill.</rule>")
-        lines.append("    <rule> SKILL.md , references .</rule>")
-        lines.append("  </rules>")
-        lines.append("  <available_skills>")
-        for name in sorted(self.skill_registry.keys()):
-            item = self.skill_registry[name]
-            skill_dir = item.get("skill_dir", "")
-            skill_md = item.get("skill_md_path", "")
-            source = item.get("source", "external")
-            scope = item.get("scope", source)
-            desc = item.get("description", "") or "()"
-            lines.append(
-                f'    <skill name="{self._escape_xml(name)}" dir="{self._escape_xml(skill_dir)}" '
-                f'skill_md="{self._escape_xml(skill_md)}" source="{self._escape_xml(source)}" '
-                f'scope="{self._escape_xml(scope)}">{self._escape_xml(desc)}</skill>'
-            )
-        lines.append("  </available_skills>")
-        lines.append("</skills_registry>")
-        self._skills_prompt_cache = "\n".join(lines)
 
     def add_skills(self, *skills):
         """
@@ -1231,9 +1203,8 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
             return self
 
         raise ValueError("basic_skills  'on'  'off'")
-
     def get_skill_markdown(self, skill_name: str) -> Dict[str, Any]:
-        """ SKILL.md ."""
+        """Load SKILL.md and return both full content and a compact summary."""
         if not isinstance(skill_name, str) or not skill_name.strip():
             available = ", ".join(sorted(self.skill_registry.keys())) or "()"
             return {
@@ -1272,6 +1243,8 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
                     "error": f" SKILL.md : {e}",
                 }
 
+        skill_outline = self._extract_skill_outline(content)
+        content_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16] if content else ""
         return {
             "ok": True,
             "name": match_name,
@@ -1279,7 +1252,75 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
             "skill_dir": meta.get("skill_dir", ""),
             "skill_md_path": meta.get("skill_md_path", ""),
             "content": content,
+            "content_digest": content_digest,
+            "when_to_use": str(skill_outline.get("when_to_use", "") or ""),
+            "steps": list(skill_outline.get("steps", []) or []),
+            "scripts": list(skill_outline.get("scripts", []) or []),
+            "references": list(skill_outline.get("references", []) or []),
         }
+
+    @staticmethod
+    def _strip_skill_frontmatter(content: str) -> str:
+        text = str(content or "")
+        if not text.startswith("---"):
+            return text
+        end = text.find("\n---", 3)
+        if end < 0:
+            return text
+        return text[end + 4 :].strip()
+
+    def _extract_skill_outline(self, content: str) -> Dict[str, Any]:
+        body = self._strip_skill_frontmatter(content)
+        lines = [str(item or "").strip() for item in body.splitlines()]
+        when_to_use = ""
+        steps: List[str] = []
+        scripts: List[str] = []
+        references: List[str] = []
+
+        for line in lines:
+            if not line or line.startswith("#"):
+                continue
+            if not when_to_use and not re.match(r"^[-*]\s+", line) and not re.match(r"^\d+[\.)]\s+", line):
+                when_to_use = line
+            step_match = re.match(r"^\d+[\.)]\s+(.*)$", line)
+            if step_match:
+                step_text = str(step_match.group(1) or "").strip()
+                if step_text:
+                    steps.append(step_text)
+            if "scripts/" in line or line.endswith(".py") or line.endswith(".sh"):
+                scripts.append(line)
+            if "references/" in line or line.startswith("http://") or line.startswith("https://"):
+                references.append(line)
+
+        def _uniq(values: List[str], limit: int) -> List[str]:
+            out: List[str] = []
+            seen = set()
+            for item in values:
+                text = str(item or "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                out.append(text)
+                if len(out) >= limit:
+                    break
+            return out
+
+        return {
+            "when_to_use": when_to_use,
+            "steps": _uniq(steps, self.SKILL_SUMMARY_STEPS_MAX),
+            "scripts": _uniq(scripts, self.SKILL_SUMMARY_ITEMS_MAX),
+            "references": _uniq(references, self.SKILL_SUMMARY_ITEMS_MAX),
+        }
+
+    def _append_skill_context_block(self, skill_context: str, block: str, digest: str = "") -> str:
+        context = str(skill_context or "").strip()
+        payload = str(block or "").strip()
+        digest_text = str(digest or "").strip()
+        if not payload:
+            return context
+        if digest_text and f"digest: {digest_text}" in context:
+            return context
+        return f"{context}\n\n{payload}".strip() if context else payload
 
     def _canonical_skill_name(self, skill_name: str) -> str:
         normalized = str(skill_name or "").strip()
@@ -1346,20 +1387,61 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
                 refs.append(name)
                 seen.add(name)
         return refs
-
-    def _build_skill_context_block(self, skill_result: Dict[str, Any], source: str = "tool") -> str:
+    def _build_skill_context_block(
+        self,
+        skill_result: Dict[str, Any],
+        source: str = "tool",
+        include_full: bool = False,
+    ) -> str:
         canonical_name = str(skill_result.get("name", "") or "").strip()
         source_text = str(source or "tool").strip().lower()
-        return (
-            f"[SKILL] {canonical_name}\n"
-            f"source: {source_text}\n"
-            f"skill_dir: {skill_result.get('skill_dir', '')}\n"
-            f"skill_md: {skill_result.get('skill_md_path', '')}\n"
-            f"description: {skill_result.get('description', '')}\n"
-            f"----- SKILL.md BEGIN -----\n"
-            f"{skill_result.get('content', '')}\n"
-            f"----- SKILL.md END -----"
-        )
+        digest = str(skill_result.get("content_digest", "") or "").strip()
+        when_to_use = str(skill_result.get("when_to_use", "") or "").strip()
+        steps = [
+            str(item).strip()
+            for item in (skill_result.get("steps", []) or [])
+            if str(item).strip()
+        ][: self.SKILL_SUMMARY_STEPS_MAX]
+        scripts = [
+            str(item).strip()
+            for item in (skill_result.get("scripts", []) or [])
+            if str(item).strip()
+        ][: self.SKILL_SUMMARY_ITEMS_MAX]
+        references = [
+            str(item).strip()
+            for item in (skill_result.get("references", []) or [])
+            if str(item).strip()
+        ][: self.SKILL_SUMMARY_ITEMS_MAX]
+
+        lines = [
+            f"[SKILL] {canonical_name}",
+            f"source: {source_text}",
+            f"digest: {digest}",
+            f"skill_dir: {skill_result.get('skill_dir', '')}",
+            f"skill_md: {skill_result.get('skill_md_path', '')}",
+            f"description: {skill_result.get('description', '')}",
+        ]
+        if when_to_use:
+            lines.append(f"when_to_use: {when_to_use}")
+        if steps:
+            lines.append("steps:")
+            lines.extend(f"- {item}" for item in steps)
+        if scripts:
+            lines.append("scripts:")
+            lines.extend(f"- {item}" for item in scripts)
+        if references:
+            lines.append("references:")
+            lines.extend(f"- {item}" for item in references)
+
+        if include_full:
+            lines.extend(
+                [
+                    "----- SKILL.md BEGIN -----",
+                    str(skill_result.get("content", "") or ""),
+                    "----- SKILL.md END -----",
+                ]
+            )
+        return "\n".join(lines).strip()
 
     def get_skill_paths_for_names(self, skill_names: List[str]) -> List[str]:
         paths: List[str] = []
@@ -1396,8 +1478,12 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
                 warnings.append(str(skill_result.get("error", f"Failed to preload skill: {canonical}")))
                 continue
             names.append(canonical)
-            block = self._build_skill_context_block(skill_result, source="preload")
-            context = f"{context}\n\n{block}".strip() if context else block
+            block = self._build_skill_context_block(skill_result, source="preload", include_full=False)
+            context = self._append_skill_context_block(
+                context,
+                block,
+                str(skill_result.get("content_digest", "") or ""),
+            )
         return names, context, warnings
 
     def add_tools(self, *args):
@@ -1933,13 +2019,13 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
                         tool_name = tool_match.group(1)
                         # 
                         if 'success' in content.lower():
-                            actions.append(f"✓ {tool_name}")
+                            actions.append(f"鉁?{tool_name}")
                         elif 'error' in content.lower():
-                            actions.append(f"✗ {tool_name}")
+                            actions.append(f"鉁?{tool_name}")
                         else:
-                            actions.append(f"→ {tool_name}")
+                            actions.append(f"鈫?{tool_name}")
                 elif content.startswith('[---'):
-                    actions.append("───  ───")
+                    actions.append("鈹€鈹€鈹€  鈹€鈹€鈹€")
                 else:
                     # 
                     snippet = content[:60] + "..." if len(content) > 60 else content
@@ -2163,36 +2249,82 @@ def create_agent(working_dir: str = ".", model=None, max_iterations: Optional[in
                  tool_output_hard_ceiling_chars: int = 200000,
                  backend: Optional[AgentBackend] = None,
                  store: Optional[AgentStore] = None,
-                 hooks: Optional[List[AgentHook]] = None) -> KlynxAgent:
+                 hooks: Optional[List[AgentHook]] = None,
+                 mode: str = "react",
+                 enable_subagent: bool = False,
+                 fast_model: Any = None,
+                 thinking_model: Any = None,
+                 small_self_loop_max: int = 3,
+                 context_warn_ratio: float = 0.80,
+                 context_hard_ratio: float = 0.92) -> KlynxAgent:
     """Create default Klynx agent instance."""
-    from .agents import KlynxAgent as DefaultKlynxAgent
+    from .agents import resolve_agent_class
+    import inspect
 
-    return DefaultKlynxAgent(
-        working_dir=working_dir,
-        model=model,
-        max_iterations=max_iterations,
-        memory_dir=memory_dir,
-        load_project_docs=load_project_docs,
-        os_name=os_name,
-        browser_headless=browser_headless,
-        append_system_prompt=append_system_prompt,
-        skills=skills,
-        tool_protocol_mode=tool_protocol_mode,
-        tool_call_mode=tool_call_mode,
-        skills_root=skills_root,
-        checkpointer=checkpointer,
-        permission_mode=permission_mode,
-        tool_virtual_root=tool_virtual_root,
-        allow_shell_commands=allow_shell_commands,
-        skill_injection_mode=skill_injection_mode,
-        max_tools_per_step=max_tools_per_step,
-        max_reads_per_file_per_step=max_reads_per_file_per_step,
-        max_retry_per_tool_per_step=max_retry_per_tool_per_step,
-        tui_stall_threshold=tui_stall_threshold,
-        full_tui_echo=full_tui_echo,
-        tool_output_delivery_mode=tool_output_delivery_mode,
-        tool_output_hard_ceiling_chars=tool_output_hard_ceiling_chars,
-        backend=backend,
-        store=store,
-        hooks=hooks,
-    )
+    agent_class = resolve_agent_class(mode)
+    requested_kwargs = {
+        "working_dir": working_dir,
+        "model": model,
+        "max_iterations": max_iterations,
+        "memory_dir": memory_dir,
+        "load_project_docs": load_project_docs,
+        "os_name": os_name,
+        "browser_headless": browser_headless,
+        "append_system_prompt": append_system_prompt,
+        "skills": skills,
+        "tool_protocol_mode": tool_protocol_mode,
+        "tool_call_mode": tool_call_mode,
+        "skills_root": skills_root,
+        "checkpointer": checkpointer,
+        "permission_mode": permission_mode,
+        "tool_virtual_root": tool_virtual_root,
+        "allow_shell_commands": allow_shell_commands,
+        "skill_injection_mode": skill_injection_mode,
+        "max_tools_per_step": max_tools_per_step,
+        "max_reads_per_file_per_step": max_reads_per_file_per_step,
+        "max_retry_per_tool_per_step": max_retry_per_tool_per_step,
+        "tui_stall_threshold": tui_stall_threshold,
+        "full_tui_echo": full_tui_echo,
+        "tool_output_delivery_mode": tool_output_delivery_mode,
+        "tool_output_hard_ceiling_chars": tool_output_hard_ceiling_chars,
+        "backend": backend,
+        "store": store,
+        "hooks": hooks,
+        "enable_subagent": enable_subagent,
+        "fast_model": fast_model,
+        "thinking_model": thinking_model,
+        "small_self_loop_max": small_self_loop_max,
+        "context_warn_ratio": context_warn_ratio,
+        "context_hard_ratio": context_hard_ratio,
+    }
+    accepted_keys = set()
+    for cls in agent_class.mro():
+        init_fn = cls.__dict__.get("__init__")
+        if init_fn is None:
+            continue
+        try:
+            signature = inspect.signature(init_fn)
+        except (TypeError, ValueError):
+            continue
+        for name, param in signature.parameters.items():
+            if name == "self":
+                continue
+            if param.kind in {
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            }:
+                continue
+            accepted_keys.add(name)
+    supported = {
+        key: value for key, value in requested_kwargs.items() if key in accepted_keys
+    }
+    return agent_class(**supported)
+
+
+
+
+
+
+
+
+

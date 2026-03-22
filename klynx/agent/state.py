@@ -90,6 +90,8 @@ class AgentState(TypedDict):
     soft_repeated_read_threshold: int
     soft_reads_per_path_threshold: int
     tool_call_history: List[Dict[str, Any]]
+    tool_ledger_recent: List[Dict[str, Any]]
+    tool_reuse_cache: Dict[str, Dict[str, Any]]
     tool_dedupe_hits: int
     repeated_read_hits: int
     read_file_failure_streaks: Dict[str, int]
@@ -155,3 +157,5 @@ class AgentState(TypedDict):
     # Recoverable summaries and subtask records
     summary_events: List[Dict[str, Any]]
     subtask_history: List[Dict[str, Any]]
+
+

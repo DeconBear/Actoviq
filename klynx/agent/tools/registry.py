@@ -2844,20 +2844,6 @@ TOOL_SCHEMAS = {
         "type": "function",
         "function": {
             "name": "launch_interactive_session",
-            "description": "(): TUI .( Python REPL, Node, Vim),.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": ", 'python', 'vim test.py'"}
-                },
-                "required": ["command"]
-            }
-        }
-    },
-    "launch_interactive_session": {
-        "type": "function",
-        "function": {
-            "name": "launch_interactive_session",
             "description": "(). exec_command(tty=true); TUI .",
             "parameters": {
                 "type": "object",
@@ -2898,7 +2884,8 @@ TOOL_SCHEMAS = {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "(, skill-creator)"}
+                    "name": {"type": "string", "description": "(, skill-creator)"},
+                    "full": {"type": "boolean", "description": "Whether to include full SKILL.md inline. Default false for summary-only injection.", "default": False}
                 },
                 "required": ["name"]
             }
@@ -3457,6 +3444,11 @@ def get_json_schemas(tool_names: list, external_tools: dict = None, external_too
                     })
     
     return schemas
+
+
+
+
+
 
 
 

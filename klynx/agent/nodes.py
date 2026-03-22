@@ -500,7 +500,6 @@ class NodesMixin:
         except Exception:
             fallback = "\n\n".join(getattr(msg, "content", "") or "" for msg in messages)
             return TokenCounter.estimate_tokens(fallback)
-
     def _build_inference_messages(
         self,
         state: AgentState,
@@ -512,111 +511,6 @@ class NodesMixin:
             iteration=iteration,
             emit_context_stats=emit_context_stats,
         )
-        """
-        :
-        - SystemMessage:  +  + /
-        - HumanMessage:  +  + 
-        """
-        overall_goal = state.get("overall_goal", "") or state.get("user_input", "")
-        current_task = state.get("current_task", "")
-        current_task_desc = (
-            f"\n  <current_task>{self._escape_xml(current_task)}</current_task>"
-            if current_task
-            else ""
-        )
-
-        project_rules = state.get("project_rules", "")
-        rules_xml = ""
-        if project_rules:
-            rules_xml = f"""<project_rules>
-{self._escape_xml(project_rules)}
-</project_rules>"""
-
-        klynx_docs = (state.get("klynx_docs", "") or "").strip()
-
-        system_sections = [self._get_system_prompt()]
-        if rules_xml:
-            system_sections.append(rules_xml)
-        if klynx_docs:
-            system_sections.append(klynx_docs)
-        system_content = "\n\n".join(section for section in system_sections if section).strip()
-
-        context = self._build_context(
-            state,
-            include_history=True,
-            emit_stats=emit_context_stats,
-        )
-        tool_names = self._escape_xml(self._get_tool_names_prompt())
-        current_focus = self._normalize_focus_text(
-            state.get("current_focus", "") or current_task or overall_goal
-        )
-        has_new_user_input = bool(state.get("has_new_user_input", False))
-        protocol_mode = self._resolve_tool_protocol_mode(state)
-        loop_note = (
-            "    [Loop Contract] think -> act -> feedback."
-            ",;,."
-        )
-        execution_note = (
-            "    [],,."
-            " 1 , 1 ;."
-        )
-        protocol_note = (
-            f"    [Protocol]: {protocol_mode}."
-            "native tool calling only."
-        )
-        evidence_note = (
-            "    [] use search_in_files for structured grep+glob hits;"
-            " use read_file for exact slices and execute_command for build/test/git/orchestration."
-            "read_file  reason, hit_id."
-            ", apply_patch; patch ,."
-            " <file_views> ,, read_file ."
-            " <mutation_truth> ,."
-        )
-        interactive_note = (
-            "    [] execute_command;"
-            "REPL,shell, exec_command, write_stdin ;"
-            "exec_command / launch_interactive_session  session_id( exec_xxx), write_stdin / close_exec_session;"
-            "read_terminal / wait_terminal_until  create_terminal  terminal name;"
-            "Windows  shell  PowerShell, workdir, cd /d;"
-            ",diff,region , TUI , <tui_views> ."
-            "TUI  assertion, pass/fail;screen hash change ,."
-        )
-        clarify_note = (
-            "    [],,."
-        )
-        human_content = f"""{context}
-
-<iteration_status>
-  <current_iteration>{iteration}</current_iteration>
-  <system_note>
-     {iteration} .
-    ,.
-    has_new_user_input={str(has_new_user_input).lower()}. false,.
-{loop_note}
-{execution_note}
-{protocol_note}
-{evidence_note}
-{interactive_note}
-{clarify_note}
-    [].,.
-    []" ->  ->  -> ". <read_coverage> , <file_views> ; read_file,.
-    [],,/,.
-    [] path:line  path:start-end;,.
-    [], state_update.
-  </system_note>
-</iteration_status>
-
-<task_context>
-  <overall_goal>{self._escape_xml(overall_goal)}</overall_goal>{current_task_desc}
-  <current_focus>{self._escape_xml(str(current_focus))}</current_focus>
-  <available_tool_names>{tool_names}</available_tool_names>
-</task_context>"""
-
-        return [
-            SystemMessage(content=system_content),
-            HumanMessage(content=human_content),
-        ]
-
 
     def _check_context_overflow(self, state: AgentState) -> bool:
         """
@@ -1144,3 +1038,4 @@ class NodesMixin:
         if decision.warning:
             self._emit("warning", f"[] {decision.warning}")
         return decision.route
+

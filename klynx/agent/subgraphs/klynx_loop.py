@@ -1,4 +1,4 @@
-"""Built-in reusable Klynx loop subgraph helpers."""
+﻿"""Built-in reusable Klynx loop subgraph helpers."""
 
 from __future__ import annotations
 
@@ -94,6 +94,8 @@ def build_klynx_initial_state(
         "soft_repeated_read_threshold": 3,
         "soft_reads_per_path_threshold": 5,
         "tool_call_history": [],
+        "tool_ledger_recent": [],
+        "tool_reuse_cache": {},
         "tool_dedupe_hits": 0,
         "repeated_read_hits": 0,
         "read_file_failure_streaks": {},
@@ -119,28 +121,7 @@ def build_klynx_initial_state(
         "tui_views": {},
         "active_tui_view_names": [],
         "last_tui_snapshots": [],
-        "tui_verification_targets": [
-            {
-                "goal": "selection_navigation",
-                "assertion": "A navigation key should move the highlighted selection in a predictable way.",
-                "pass_condition": "selected option changes or highlighted row changes consistently.",
-            },
-            {
-                "goal": "maze_enter_game",
-                "assertion": "Entering the maze should transition from lobby/menu to the maze gameplay screen.",
-                "pass_condition": "screen contains maze/gameplay markers instead of menu-only content.",
-            },
-            {
-                "goal": "maze_key_response",
-                "assertion": "After a movement key, at least one gameplay signal should change.",
-                "pass_condition": "step count, player position, or move/block/win status changes.",
-            },
-            {
-                "goal": "maze_readability",
-                "assertion": "Maze screen should expose distinct markers and readable controls/info.",
-                "pass_condition": "player/goal/wall markers are distinguishable and controls/info remain visible.",
-            },
-        ],
+        "tui_verification_targets": [],
         "last_tui_verification": {},
         "recent_tui_verifications": [],
         "tui_verification_digest": "",
@@ -190,3 +171,5 @@ def run_klynx_loop_node(runtime, payload: Dict[str, Any]) -> Iterable[dict]:
 def build_klynx_loop_subgraph(builder, *, node_name: str = "klynx_loop"):
     builder.add_node(node_name)
     return builder
+
+

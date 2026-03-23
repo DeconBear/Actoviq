@@ -355,28 +355,6 @@ class KlynxGraphBuilder:
         self.with_runtime_defaults(**defaults)
         return self
 
-    def request(self, **runtime_defaults: Any):
-        """
-        Configure this builder for RequestOrchestrator runtime.
-
-        This is a convenience preset equivalent to:
-        - add_node("klynx_loop")
-        - set entry point to "klynx_loop" (when unset)
-        - runtime default `mode="request_orchestrator"`
-        - if `model` is not provided, fallback to `fast_model` or
-          `thinking_model` as baseline model for ask/fallback paths.
-        """
-        self._ensure_klynx_loop_entry()
-        defaults = {"mode": "request_orchestrator"}
-        defaults.update(dict(runtime_defaults or {}))
-        if defaults.get("model") is None:
-            if defaults.get("fast_model") is not None:
-                defaults["model"] = defaults.get("fast_model")
-            elif defaults.get("thinking_model") is not None:
-                defaults["model"] = defaults.get("thinking_model")
-        self.with_runtime_defaults(**defaults)
-        return self
-
     def ask(self, **runtime_defaults: Any):
         """
         Configure this builder for ask-first usage.

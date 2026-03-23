@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "klynx"
-version = "0.0.22"
+version = "0.0.23"
 description = "A sophisticated, universal agentic AI coding framework built on LangGraph and LiteLLM."
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
-  { name="QZX", email="qzx480@gmail.com" },
+  { name="DeconBear", email="qzx480@gmail.com" },
 ]
 license = "MIT"
 license-files = ["LICENSE"]

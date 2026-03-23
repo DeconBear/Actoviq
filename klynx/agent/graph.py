@@ -2254,7 +2254,7 @@ def create_agent(working_dir: str = ".", model=None, max_iterations: Optional[in
                  enable_subagent: bool = False,
                  fast_model: Any = None,
                  thinking_model: Any = None,
-                 small_self_loop_max: int = 3,
+                 small_self_loop_max: int = 10,
                  context_warn_ratio: float = 0.80,
                  context_hard_ratio: float = 0.92) -> KlynxAgent:
     """Create default Klynx agent instance."""

@@ -16,12 +16,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
 from ...graph import GraphKlynxAgent
+from ...routing import RoutingPolicy
 from ...state import AgentState
-from ...subgraphs import stream_ask
+from ...subgraphs import build_klynx_initial_state, stream_ask
 
 
 def _load_prompt_asset(*relative_parts: str, fallback: str = "") -> str:
@@ -143,7 +144,7 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         enable_subagent: bool = False,
         fast_model: Any = None,
         thinking_model: Any = None,
-        small_self_loop_max: int = 3,
+        small_self_loop_max: int = 10,
         context_warn_ratio: float = 0.80,
         context_hard_ratio: float = 0.92,
         **kwargs,
@@ -336,6 +337,47 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
             "include_recent_call_ids": include_recent_call_ids,
         }
 
+    def _execute_single_tool_action(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        loaded_skill_names: List[str],
+        skill_context: str,
+        command_op_id: str = "",
+        command_target_op_id: str = "",
+        tool_artifacts: Any = None,
+        thread_id: str = "",
+    ) -> Tuple[str, List[str], str]:
+        """
+        在 RequestOrchestrator 中额外接管 request_think：
+        - 作为小脑升级信号工具执行；
+        - 不依赖 ToolRegistry 内建实现；
+        - 其余工具复用主 ReAct 工具执行链路。
+        """
+        _ = (command_op_id, command_target_op_id, tool_artifacts, thread_id)
+        normalized_tool_name = str(tool_name or "").strip()
+        if normalized_tool_name == self.REQUEST_THINK_TOOL_NAME:
+            payload = self._normalize_request_think_payload(params if isinstance(params, dict) else {})
+            # 若模型遗漏 task，使用当前运行任务做兜底，避免升级请求失效。
+            if not str(payload.get("task", "") or "").strip():
+                payload["task"] = str(getattr(self, "_request_orch_current_task", "") or "").strip()
+            self._request_orch_small_request_think = dict(payload)
+            return (
+                "<success>request_think accepted by runtime</success>",
+                loaded_skill_names,
+                skill_context,
+            )
+        return super()._execute_single_tool_action(
+            tool_name=normalized_tool_name,
+            params=params,
+            loaded_skill_names=loaded_skill_names,
+            skill_context=skill_context,
+            command_op_id=command_op_id,
+            command_target_op_id=command_target_op_id,
+            tool_artifacts=tool_artifacts,
+            thread_id=thread_id,
+        )
+
     def _invoke_small_brain_with_tools(
         self,
         *,
@@ -348,7 +390,7 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         返回统一结构：
         {
           "direct_answer": str,
-          "tool_plan": list[tool call],
+          "tool_calls": list[tool call],
           "request_think": dict|None,
           "decision": str,
           "reason_summary": str
@@ -356,7 +398,7 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         """
         fallback = {
             "direct_answer": "",
-            "tool_plan": [],
+            "tool_calls": [],
             "request_think": {
                 "message": "Need Think Brain to continue due insufficient confidence in short loop.",
                 "reason": "small_brain_fallback",
@@ -387,7 +429,7 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
 
         content_text = self._extract_response_text(response).strip()
         raw_tool_calls = list(getattr(response, "tool_calls", []) or [])
-        tool_plan: List[Dict[str, Any]] = []
+        tool_calls: List[Dict[str, Any]] = []
         request_think: Optional[Dict[str, Any]] = None
 
         for row in raw_tool_calls:
@@ -405,7 +447,7 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
             tool_name = self._normalize_tool_name(raw_tool_name)
             if not tool_name:
                 continue
-            tool_plan.append(
+            tool_calls.append(
                 {
                     "call_id": f"call_{uuid.uuid4().hex[:8]}",
                     "tool": tool_name,
@@ -417,15 +459,15 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         if request_think:
             return {
                 "direct_answer": "",
-                "tool_plan": [],
+                "tool_calls": [],
                 "request_think": request_think,
                 "decision": "escalate_via_request_tool",
                 "reason_summary": str(request_think.get("reason", "") or ""),
             }
-        if tool_plan:
+        if tool_calls:
             return {
                 "direct_answer": "",
-                "tool_plan": tool_plan,
+                "tool_calls": tool_calls,
                 "request_think": None,
                 "decision": "tool_calling",
                 "reason_summary": "",
@@ -433,7 +475,7 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         if content_text:
             return {
                 "direct_answer": content_text,
-                "tool_plan": [],
+                "tool_calls": [],
                 "request_think": None,
                 "decision": "direct_answer",
                 "reason_summary": "",
@@ -456,7 +498,7 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         """
         fallback = {
             "direct_answer": "",
-            "tool_plan": [],
+            "tool_calls": [],
             "request_think": {
                 "message": "Need Think Brain to continue due insufficient confidence in short loop.",
                 "reason": "small_brain_fallback",
@@ -511,7 +553,7 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
             return self._invoke_small_brain_with_tools(payload=payload, system_prompt=system_prompt)
 
         content_text = "".join(content_parts).strip()
-        tool_plan: List[Dict[str, Any]] = []
+        tool_calls: List[Dict[str, Any]] = []
         request_think: Optional[Dict[str, Any]] = None
 
         for row in raw_tool_calls:
@@ -527,7 +569,7 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
             tool_name = self._normalize_tool_name(raw_tool_name)
             if not tool_name:
                 continue
-            tool_plan.append(
+            tool_calls.append(
                 {
                     "call_id": f"call_{uuid.uuid4().hex[:8]}",
                     "tool": tool_name,
@@ -539,15 +581,15 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         if request_think:
             return {
                 "direct_answer": "",
-                "tool_plan": [],
+                "tool_calls": [],
                 "request_think": request_think,
                 "decision": "escalate_via_request_tool",
                 "reason_summary": str(request_think.get("reason", "") or ""),
             }
-        if tool_plan:
+        if tool_calls:
             return {
                 "direct_answer": "",
-                "tool_plan": tool_plan,
+                "tool_calls": tool_calls,
                 "request_think": None,
                 "decision": "tool_calling",
                 "reason_summary": "",
@@ -555,7 +597,7 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         if content_text:
             return {
                 "direct_answer": content_text,
-                "tool_plan": [],
+                "tool_calls": [],
                 "request_think": None,
                 "decision": "direct_answer",
                 "reason_summary": "",
@@ -922,6 +964,137 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
             )
         return plans
 
+    def _canonical_tool_call_signature(self, tool_calls: List[Dict[str, Any]]) -> str:
+        """
+        生成工具调用集合签名（忽略 call_id），用于检测连续重复调用。
+
+        这是软提示信号，不做硬拦截。
+        """
+        normalized: List[Dict[str, Any]] = []
+        for row in list(tool_calls or []):
+            if not isinstance(row, dict):
+                continue
+            tool_name = str(row.get("tool", "") or "").strip()
+            if not tool_name:
+                continue
+            args = row.get("args", {})
+            if not isinstance(args, dict):
+                args = {}
+            normalized.append({"tool": tool_name, "args": args})
+        try:
+            return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(normalized)
+
+    def _build_small_react_feedback(
+        self,
+        *,
+        records: List[Dict[str, Any]],
+        repeated_count: int,
+    ) -> str:
+        """
+        构造小脑下一轮可见的反馈文本（feedback）。
+
+        目标：
+        - 沉淀上一轮关键执行结果；
+        - 提醒避免无增量重复调用；
+        - 让小脑自行选择“继续调用 / 直接回答 / 请求大脑”。
+        """
+        rows = list(records or [])
+        lines: List[str] = [f"上一轮执行了 {len(rows)} 个工具调用。"]
+        for row in rows[-4:]:
+            tool_name = str(row.get("tool", "") or "").strip()
+            output_text = str(row.get("output", "") or "")
+            success = "<error>" not in output_text.lower()
+            lines.append(f"- {tool_name}: success={str(success).lower()}")
+        if int(repeated_count or 0) > 0:
+            lines.append(
+                "检测到连续重复的工具调用签名。若无新增证据需求，请不要重复相同参数调用。"
+            )
+        lines.append("请在下一轮自主选择：继续调用工具、直接回答，或调用 request_think。")
+        return "\n".join(lines).strip()
+
+    def _expand_parallel_tool_plan(
+        self,
+        tool_plan: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        展开 parallel_tool_call 包装调用。
+
+        说明：
+        - RequestOrchestrator 的执行器按“单工具动作”执行；
+        - 若模型返回 parallel_tool_call，需要先展开为真实工具列表；
+        - 这里仅做“计划展开”，不引入额外路由层。
+
+        返回：
+        - expanded_plan: 展开后的可执行计划；
+        - expansion_events: 展开阶段产生的 info/warning 事件。
+        """
+        expanded_plan: List[Dict[str, Any]] = []
+        expansion_events: List[Dict[str, Any]] = []
+
+        for row in list(tool_plan or []):
+            if not isinstance(row, dict):
+                continue
+            tool_name = str(row.get("tool", "") or "").strip()
+            args = row.get("args", {})
+            if not isinstance(args, dict):
+                args = {}
+
+            if tool_name != "parallel_tool_call":
+                expanded_plan.append(
+                    {
+                        "call_id": str(row.get("call_id", "") or "").strip() or f"call_{uuid.uuid4().hex[:8]}",
+                        "tool": tool_name,
+                        "args": dict(args),
+                        "parallel_group": str(row.get("parallel_group", "") or "").strip(),
+                    }
+                )
+                continue
+
+            nested_calls = args.get("calls", [])
+            if not isinstance(nested_calls, list) or not nested_calls:
+                expansion_events.append(
+                    {
+                        "type": "warning",
+                        "content": "[Tool Parser] parallel_tool_call ignored: calls is empty or invalid.",
+                    }
+                )
+                continue
+
+            group_id = str(row.get("call_id", "") or "").strip() or f"group_{uuid.uuid4().hex[:8]}"
+            expanded_count = 0
+            for nested in nested_calls:
+                if not isinstance(nested, dict):
+                    continue
+                nested_tool = self._normalize_tool_name(str(nested.get("tool", "") or "").strip())
+                if not nested_tool or nested_tool == "parallel_tool_call":
+                    continue
+                nested_params = nested.get("params", {})
+                if not isinstance(nested_params, dict):
+                    nested_params = {}
+                nested_call_id = str(
+                    nested.get("call_id", "") or nested.get("id", "") or nested.get("tool_call_id", "")
+                ).strip() or f"call_{uuid.uuid4().hex[:8]}"
+                expanded_plan.append(
+                    {
+                        "call_id": nested_call_id,
+                        "tool": nested_tool,
+                        "args": dict(nested_params),
+                        "parallel_group": group_id,
+                    }
+                )
+                expanded_count += 1
+
+            expansion_events.append(
+                {
+                    "type": "info",
+                    "content": f"[Tool Parser] parallel_tool_call expanded to {expanded_count} call(s).",
+                }
+            )
+
+        return expanded_plan, expansion_events
+
     def _normalize_task_board(self, value: Any) -> List[Dict[str, Any]]:
         """
         规范化大脑产出的任务板。
@@ -985,6 +1158,10 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
             "big_compact_summary": "",
             # 小脑通过 request_think 提交给大脑的最近一次请求。
             "small_brain_handoff": None,
+            # 小脑 ReAct 反馈区：用于下一轮自我决策与防重复提示。
+            "small_react_feedback": "",
+            "small_last_tool_signature": "",
+            "small_same_signature_count": 0,
             # 预留：循环打击计数，可用于后续收敛策略。
             "loop_strike": 0,
         }
@@ -1054,27 +1231,59 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         # 工具执行过程中产生的工件（例如技能加载副作用）统一复用一个容器。
         tool_artifacts: List[Dict[str, Any]] = []
         events: List[Dict[str, Any]] = []
+        expanded_plan, expansion_events = self._expand_parallel_tool_plan(tool_plan)
+        events.extend(expansion_events)
         records: List[Dict[str, Any]] = []
-        total = len(tool_plan)
-        for index, row in enumerate(tool_plan, 1):
+        prefetched_parallel_outputs: Dict[int, Dict[str, Any]] = {}
+        parallel_candidate_count = 0
+        if expanded_plan:
+            try:
+                dispatch_style_calls = [
+                    {
+                        "tool": str(item.get("tool", "") or "").strip(),
+                        "params": dict(item.get("args", {}) or {}),
+                    }
+                    for item in expanded_plan
+                    if isinstance(item, dict)
+                ]
+                prefetched_parallel_outputs, parallel_candidate_count = self._prefetch_parallel_tool_outputs(
+                    tool_calls=dispatch_style_calls,
+                    loaded_skill_names=loaded_skill_names,
+                    skill_context=skill_context,
+                )
+            except Exception:
+                prefetched_parallel_outputs, parallel_candidate_count = {}, 0
+        if parallel_candidate_count > 1:
+            events.append(
+                {
+                    "type": "info",
+                    "content": f"[Tool Scheduler] parallel candidates={parallel_candidate_count}",
+                }
+            )
+        total = len(expanded_plan)
+        for index, row in enumerate(expanded_plan, 1):
             call_id = str(row.get("call_id", "") or f"call_{uuid.uuid4().hex[:8]}").strip()
             tool_name = str(row.get("tool", "") or "").strip()
             params = dict(row.get("args", {}) or {})
             # 先发出“工具开始执行”事件，便于前端/日志实时感知进度。
             events.append({"type": "tool_exec", "content": f"[Tool {index}/{total}] {tool_name}"})
-            try:
-                output, loaded_skill_names, skill_context = self._execute_single_tool_action(
-                    tool_name=tool_name,
-                    params=params,
-                    loaded_skill_names=loaded_skill_names,
-                    skill_context=skill_context,
-                    tool_artifacts=tool_artifacts,
-                    thread_id=thread_id,
-                )
-                output_text = str(output or "")
-            except Exception as exc:
-                # 工具异常不抛出到外层循环，转成可观测错误文本继续推进。
-                output_text = f"<error>{exc}</error>"
+            prefetched = prefetched_parallel_outputs.get(index - 1)
+            if isinstance(prefetched, dict) and not str(prefetched.get("error", "") or "").strip():
+                output_text = str(prefetched.get("output", "") or "")
+            else:
+                try:
+                    output, loaded_skill_names, skill_context = self._execute_single_tool_action(
+                        tool_name=tool_name,
+                        params=params,
+                        loaded_skill_names=loaded_skill_names,
+                        skill_context=skill_context,
+                        tool_artifacts=tool_artifacts,
+                        thread_id=thread_id,
+                    )
+                    output_text = str(output or "")
+                except Exception as exc:
+                    # 工具异常不抛出到外层循环，转成可观测错误文本继续推进。
+                    output_text = f"<error>{exc}</error>"
             # 工具执行结束事件，附带 call_id 便于关联。
             events.append({"type": "tool_result", "content": output_text, "tool_name": tool_name, "call_id": call_id})
             record = {
@@ -1092,6 +1301,301 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
             thread_state["tool_call_order"].append(call_id)
             thread_state["recent_tool_call_ids"] = list(thread_state["tool_call_order"][-12:])
         return events, records, loaded_skill_names, skill_context
+
+    def _drain_emitted_events(self) -> List[Dict[str, Any]]:
+        """提取并清空运行时事件缓冲区。"""
+        events: List[Dict[str, Any]] = []
+        buffer = getattr(self, "_event_buffer", None)
+        while buffer:
+            try:
+                events.append(buffer.popleft())
+            except Exception:
+                try:
+                    events.append(buffer.pop(0))
+                except Exception:
+                    break
+        return events
+
+    def _merge_agent_state_patch(
+        self,
+        state: Dict[str, Any],
+        patch: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        合并 ReAct 节点 patch 到本地状态。
+
+        注意：LangGraph 中 messages 使用 add_messages reducer；这里手动执行时需要显式“追加”。
+        """
+        merged = dict(state or {})
+        if not isinstance(patch, dict):
+            return merged
+        for key, value in patch.items():
+            if key == "messages":
+                old_messages = list(merged.get("messages", []) or [])
+                new_messages = list(value or []) if isinstance(value, list) else []
+                merged["messages"] = old_messages + new_messages
+            else:
+                merged[key] = value
+        return merged
+
+    def _extract_last_ai_answer(self, state: Dict[str, Any]) -> str:
+        """从状态消息中提取最近一条 AI 文本回答。"""
+        messages = list((state or {}).get("messages", []) or [])
+        for row in reversed(messages):
+            if isinstance(row, AIMessage):
+                text = str(getattr(row, "content", "") or "").strip()
+                if text:
+                    return text
+        return ""
+
+    def _extract_tool_result_records_from_messages(
+        self,
+        messages: List[Any],
+    ) -> List[Dict[str, Any]]:
+        """从 HumanMessage 的 <tool_result ...> 块中提取工具结果记录。"""
+        records: List[Dict[str, Any]] = []
+        pattern = re.compile(
+            r"<tool_result\s+tool=\"(?P<tool>[^\"]+)\"(?P<attrs>[^>]*)>\s*(?P<body>.*?)\s*</tool_result>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for row in list(messages or []):
+            if not isinstance(row, HumanMessage):
+                continue
+            content = str(getattr(row, "content", "") or "")
+            match = pattern.search(content)
+            if not match:
+                continue
+            attrs_text = str(match.group("attrs") or "")
+            attrs = {
+                str(key): str(value)
+                for key, value in re.findall(r'([a-zA-Z0-9_]+)="([^"]*)"', attrs_text)
+            }
+            records.append(
+                {
+                    "call_id": str(attrs.get("call_id", "") or "").strip(),
+                    "tool": str(match.group("tool") or "").strip(),
+                    "output": str(match.group("body") or "").strip(),
+                }
+            )
+        return records
+
+    def _sync_small_react_records_to_thread_state(
+        self,
+        *,
+        thread_state: Dict[str, Any],
+        small_state: Dict[str, Any],
+        act_patch: Dict[str, Any],
+    ) -> None:
+        """
+        将主 ReAct 执行产物同步到 RequestOrchestrator 线程态。
+
+        目的：保持大脑注入能力可复用（按 call_id 暴露最近工具结果）。
+        """
+        tool_results = self._extract_tool_result_records_from_messages(
+            list((act_patch or {}).get("messages", []) or [])
+        )
+        if not tool_results:
+            return
+
+        ledger_rows = list((small_state or {}).get("tool_ledger_recent", []) or [])
+        history_rows = list((small_state or {}).get("tool_call_history", []) or [])
+        params_by_fingerprint: Dict[str, Dict[str, Any]] = {}
+        for item in history_rows:
+            if not isinstance(item, dict):
+                continue
+            fingerprint = str(item.get("fingerprint", "") or "").strip()
+            params_raw = item.get("params", "")
+            if not fingerprint:
+                continue
+            params_obj: Dict[str, Any] = {}
+            if isinstance(params_raw, str):
+                try:
+                    parsed = json.loads(params_raw)
+                    if isinstance(parsed, dict):
+                        params_obj = parsed
+                except Exception:
+                    params_obj = {}
+            elif isinstance(params_raw, dict):
+                params_obj = dict(params_raw)
+            params_by_fingerprint[fingerprint] = params_obj
+
+        for row in tool_results:
+            call_id = str(row.get("call_id", "") or "").strip()
+            tool_name = str(row.get("tool", "") or "").strip()
+            output_text = str(row.get("output", "") or "")
+            if not tool_name:
+                continue
+            if not call_id:
+                call_id = f"call_{uuid.uuid4().hex[:8]}"
+            if call_id in (thread_state.get("tool_calls", {}) or {}):
+                continue
+
+            fingerprint = ""
+            for item in reversed(ledger_rows):
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("call_id", "") or "").strip() == call_id:
+                    fingerprint = str(item.get("fingerprint", "") or "").strip()
+                    break
+            args = dict(params_by_fingerprint.get(fingerprint, {}) or {})
+            record = {
+                "call_id": call_id,
+                "tool": tool_name,
+                "args": args,
+                "output": output_text,
+                "summary": output_text[:1200],
+                "created_at": int(time.time()),
+            }
+            thread_state["tool_calls"][call_id] = dict(record)
+            thread_state["tool_call_order"].append(call_id)
+            thread_state["recent_tool_call_ids"] = list(thread_state["tool_call_order"][-12:])
+
+    def _run_small_brain_react_loop(
+        self,
+        *,
+        task: str,
+        thread_id: str,
+        thread_state: Dict[str, Any],
+        act_brain_system_prompt: str,
+        runtime_append: str,
+    ):
+        """
+        复用主 ReAct 节点完成“小脑升级前循环”。
+
+        约束：
+        - 系统提示词继续使用 request_act_base.md；
+        - 运行模型切换为 fast_model；
+        - 工具层额外保留 request_think 作为升级信号。
+        """
+        original_model = self.model
+        had_locked_prompt_attr = hasattr(self, "LOCKED_SYSTEM_PROMPT")
+        original_locked_prompt = getattr(self, "LOCKED_SYSTEM_PROMPT", "")
+        original_json_schemas = list(getattr(self, "_json_schemas", []) or [])
+        original_request_task = str(getattr(self, "_request_orch_current_task", "") or "")
+        original_request_handoff = getattr(self, "_request_orch_small_request_think", None)
+        original_runtime_append = str(getattr(self, "_runtime_system_prompt_append", "") or "")
+        tool_inserted = False
+        answer_streamed = False
+
+        # request_think 在小脑阶段作为内部升级工具注入。
+        request_think_desc = str(
+            (
+                self.REQUEST_THINK_TOOL_SCHEMA.get("function", {}) or {}
+            ).get("description", "")
+            or "Internal escalation tool to request Think Brain."
+        ).strip()
+
+        small_state = build_klynx_initial_state(
+            self,
+            str(task or ""),
+            thread_id=str(thread_id or "default"),
+            thinking_context=False,
+            system_prompt_append=str(runtime_append or "").strip(),
+        )
+
+        try:
+            self.model = self.fast_model
+            self.LOCKED_SYSTEM_PROMPT = str(act_brain_system_prompt or "").strip()
+            self._request_orch_current_task = str(task or "")
+            self._request_orch_small_request_think = None
+
+            def _yield_small_events():
+                nonlocal answer_streamed
+                for raw_event in self._drain_emitted_events():
+                    row = dict(raw_event or {})
+                    if str(row.get("type", "") or "").strip().lower() == "token":
+                        answer_streamed = True
+                    if not str(row.get("brain", "") or "").strip():
+                        row["brain"] = "ACT"
+                    yield row
+
+            if self.REQUEST_THINK_TOOL_NAME not in self.tools:
+                self.tools[self.REQUEST_THINK_TOOL_NAME] = request_think_desc
+                tool_inserted = True
+                self._refresh_tool_prompts()
+            self._json_schemas = self._build_small_brain_native_tools()
+
+            # 对齐主 ReAct 起始节点：init -> inject_system_prompt -> load_context
+            init_patch = self._init_node(small_state) or {}
+            small_state = self._merge_agent_state_patch(small_state, init_patch)
+            for event in _yield_small_events():
+                yield event
+
+            inject_node = getattr(self, "_inject_system_prompt_node", None)
+            if callable(inject_node):
+                inject_patch = inject_node(small_state) or {}
+                small_state = self._merge_agent_state_patch(small_state, inject_patch)
+                for event in _yield_small_events():
+                    yield event
+            else:
+                # RequestOrchestrator 默认不实现该节点；这里按同语义写入运行时追加提示。
+                self._runtime_system_prompt_append = str(runtime_append or "").strip()
+                small_state["system_prompt_append"] = str(runtime_append or "").strip()
+
+            context_patch = self._load_context_node(small_state) or {}
+            small_state = self._merge_agent_state_patch(small_state, context_patch)
+            for event in _yield_small_events():
+                yield event
+
+            while int(small_state.get("iteration_count", 0) or 0) < self.small_self_loop_max:
+                model_patch = self._model_inference_node(small_state) or {}
+                small_state = self._merge_agent_state_patch(small_state, model_patch)
+                for event in _yield_small_events():
+                    yield event
+
+                act_patch = self._act_node(small_state) or {}
+                small_state = self._merge_agent_state_patch(small_state, act_patch)
+                self._sync_small_react_records_to_thread_state(
+                    thread_state=thread_state,
+                    small_state=small_state,
+                    act_patch=act_patch,
+                )
+                for event in _yield_small_events():
+                    yield event
+
+                if isinstance(self._request_orch_small_request_think, dict):
+                    break
+
+                feedback_patch = self._feedback_node(small_state) or {}
+                small_state = self._merge_agent_state_patch(small_state, feedback_patch)
+                for event in _yield_small_events():
+                    yield event
+
+                decision = RoutingPolicy.decide(
+                    state=small_state,
+                    max_iterations=self.small_self_loop_max,
+                )
+                if decision.route == "end_direct":
+                    break
+
+            answer = self._extract_last_ai_answer(small_state)
+            return {
+                "iteration_count": int(small_state.get("iteration_count", 0) or 0),
+                "answer": answer,
+                "answer_streamed": bool(answer_streamed),
+                "ended_without_tools": bool(small_state.get("ended_without_tools", False)),
+                "request_think": (
+                    dict(self._request_orch_small_request_think)
+                    if isinstance(self._request_orch_small_request_think, dict)
+                    else None
+                ),
+            }
+        finally:
+            self.model = original_model
+            self._json_schemas = original_json_schemas
+            self._request_orch_current_task = original_request_task
+            self._request_orch_small_request_think = original_request_handoff
+            self._runtime_system_prompt_append = original_runtime_append
+            if tool_inserted:
+                self.tools.pop(self.REQUEST_THINK_TOOL_NAME, None)
+                self._refresh_tool_prompts()
+            if had_locked_prompt_attr:
+                self.LOCKED_SYSTEM_PROMPT = original_locked_prompt
+            else:
+                try:
+                    delattr(self, "LOCKED_SYSTEM_PROMPT")
+                except Exception:
+                    pass
 
     def _stream_answer_events(self, answer: str, chunk_size: int = 64) -> Iterable[Dict[str, Any]]:
         """将最终答案切片为 token 事件流，便于前端渐进式渲染。"""
@@ -1144,19 +1648,13 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         ).strip()
         act_brain_system_prompt = _load_prompt_asset(
             "prompts",
-            "request_act_base.md",
-            fallback=(
-                "# 角色定位\n\n"
-                "你是 Klynx RequestOrchestrator 的 Act Brain。"
-            ),
+            "system_base.md",
+            fallback="",
         )
         think_brain_system_prompt = _load_prompt_asset(
             "prompts",
             "request_think_base.md",
-            fallback=(
-                "# 角色定位\n\n"
-                "你是 Klynx RequestOrchestrator 的 Think Brain。"
-            ),
+            fallback="",
         )
         with self._request_lock:
             # 每次 invoke 基于传入 task 重建线程状态。
@@ -1176,100 +1674,64 @@ class RequestOrchestratorAgent(GraphKlynxAgent):
         # 统一迭代计数：覆盖小脑与大脑阶段。
         iteration_count = 0
 
-        # 阶段 1：小脑预循环（默认 <= 3 轮）
-        for loop_index in range(1, self.small_self_loop_max + 1):
-            iteration_count += 1
-            # 上下文压力过高时，先进行轻量压缩再继续。
-            ratio = self._estimate_context_ratio(state)
-            if ratio >= self.context_warn_ratio:
-                summary = self._compact_state(state, scope="small", reason=f"context_pressure_preloop_{loop_index}")
-                yield {"type": "info", "content": f"[Compact][small] {summary}"}
-
-            # 小脑输入：任务本身 + 最近调用窗口 + 白名单工具。
-            # 约定：
-            # - 首次 request_think 之前，系统自动把已有工具执行结果注入给小脑；
-            # - 首次 request_think 之后，小脑如需结果应再次调用工具自行获取（手动模式）。
-            has_requested_think = bool(state.get("small_brain_handoff"))
-            recent_call_ids = list(state.get("recent_tool_call_ids", []) or [])
-            auto_injected_tool_results = ""
-            if not has_requested_think and recent_call_ids:
-                auto_injected_tool_results = self._inject_tool_results_by_ids(
-                    thread_state=state,
-                    call_ids=recent_call_ids,
-                    max_items=max(1, len(recent_call_ids)),
-                    per_item_chars=6000,
-                    max_total_chars=80000,
-                )
-            allowed_tools = self._active_tool_names()
-            small_payload = {
-                "request_type": "small_loop",
-                "task": task,
-                "loop_index": loop_index,
-                "max_loop": self.small_self_loop_max,
-                "recent_tool_call_ids": recent_call_ids,
-                "recent_tool_results": auto_injected_tool_results,
-                "tool_result_injection_mode": (
-                    "auto_before_first_request_think"
-                    if not has_requested_think
-                    else "manual_tool_call_after_first_request_think"
-                ),
-                "checkpoint_summary": state.get("checkpoint_summary", ""),
-                "allowed_tools": allowed_tools,
-            }
-            small_reply = yield from self._invoke_small_brain_with_tools_stream(
-                payload=small_payload,
-                system_prompt=(
-                    f"{act_brain_system_prompt}\n\n"
-                    f"{self._build_allowed_tools_guidance()}\n"
-                    f"{runtime_append}"
-                ).strip(),
-            )
-
-            # 读取小脑决策结果。
-            direct_answer = str(small_reply.get("direct_answer", "") or "").strip()
-            direct_answer_streamed = bool(small_reply.get("_direct_answer_streamed", False))
-            tool_plan = self._normalize_tool_plan(small_reply.get("tool_plan", []))
-            request_think = small_reply.get("request_think")
-            need_think = bool(request_think) or (not direct_answer and not tool_plan)
-
-            # 小脑可直接回答时，立即流式输出并结束。
-            if direct_answer:
-                if not direct_answer_streamed:
-                    for event in self._stream_answer_events(direct_answer):
-                        yield event
-                yield {
-                    "type": "done",
-                    "content": "",
-                    "answer": direct_answer,
-                    "iteration_count": iteration_count,
-                    "task_completed": True,
-                    "total_tokens": 0,
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                }
-                return
-
-            # 小脑给出工具计划且判定无需大脑时，直接执行并继续下一轮小脑判断。
-            if tool_plan and not need_think:
-                events, records, loaded_skill_names, skill_context = self._run_tool_plan(
-                    tool_plan=tool_plan,
-                    thread_state=state,
-                    loaded_skill_names=loaded_skill_names,
-                    skill_context=skill_context,
-                    thread_id=normalized_thread_id,
-                )
-                for event in events:
+        # 阶段 1：小脑升级前循环，切到主 ReAct 节点逻辑。
+        small_phase = yield from self._run_small_brain_react_loop(
+            task=str(task or ""),
+            thread_id=normalized_thread_id,
+            thread_state=state,
+            act_brain_system_prompt=act_brain_system_prompt,
+            runtime_append=runtime_append,
+        )
+        iteration_count += int(small_phase.get("iteration_count", 0) or 0)
+        small_answer = str(small_phase.get("answer", "") or "").strip()
+        small_answer_streamed = bool(small_phase.get("answer_streamed", False))
+        small_ended_without_tools = bool(small_phase.get("ended_without_tools", False))
+        if small_answer:
+            if not small_answer_streamed:
+                for event in self._stream_answer_events(small_answer):
                     yield event
-                if records:
-                    state["recent_tool_call_ids"] = [row["call_id"] for row in records][-12:]
-                continue
-            # 需要大脑时，跳出小脑循环。
-            if need_think:
-                if isinstance(request_think, dict):
-                    state["small_brain_handoff"] = dict(request_think)
-                break
+            yield {
+                "type": "done",
+                "content": "",
+                "answer": small_answer,
+                "iteration_count": iteration_count,
+                "task_completed": True,
+                "total_tokens": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+            }
+            return
+        if small_ended_without_tools:
+            end_message = "未触发工具调用，任务结束。"
+            for event in self._stream_answer_events(end_message):
+                yield event
+            yield {
+                "type": "done",
+                "content": "stopped",
+                "answer": end_message,
+                "iteration_count": iteration_count,
+                "task_completed": False,
+                "total_tokens": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+            }
+            return
+        request_think = small_phase.get("request_think")
+        if isinstance(request_think, dict):
+            state["small_brain_handoff"] = dict(request_think)
 
         # 阶段 2：升级到大脑，先做全局规划。
+        if not isinstance(state.get("small_brain_handoff"), dict):
+            state["small_brain_handoff"] = {
+                "message": (
+                    "Act Brain reached self-loop limit without convergence. "
+                    "Need Think Brain to continue."
+                ),
+                "reason": "small_loop_max_reached",
+                "focus": "analyze current evidence and provide next actions",
+                "task": str(task or ""),
+                "include_recent_call_ids": list(state.get("recent_tool_call_ids", []) or [])[-8:],
+            }
         yield {"type": "info", "content": "[RequestAgent] Escalate to big brain."}
         handoff_request = dict(state.get("small_brain_handoff", {}) or {})
         include_recent_call_ids = list(handoff_request.get("include_recent_call_ids", []) or [])

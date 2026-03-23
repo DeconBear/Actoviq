@@ -927,6 +927,72 @@ class LiteLLMChat:
                 print(f"[Model Call Error] {type(exc).__name__}: {exc} | {summary}")
 
     @staticmethod
+    def _error_contains_param_rejection(error_text: str, param_name: str) -> bool:
+        """Detect provider-side request validation errors for a specific OpenAI-style param."""
+        text = str(error_text or "").lower()
+        if not text:
+            return False
+        normalized = str(param_name or "").strip().lower()
+        if not normalized:
+            return False
+
+        aliases = {normalized, normalized.replace("_", " ")}
+        if normalized.endswith("s"):
+            aliases.add(normalized[:-1])
+            aliases.add(normalized[:-1].replace("_", " "))
+        if not any(alias and alias in text for alias in aliases):
+            return False
+
+        rejection_markers = (
+            "unsupported",
+            "not support",
+            "unexpected",
+            "unknown",
+            "unrecognized",
+            "invalid",
+            "not allowed",
+            "forbidden",
+            "extra_forbidden",
+            "extra fields not permitted",
+            "additional properties are not allowed",
+        )
+        return any(marker in text for marker in rejection_markers)
+
+    def _apply_call_kwargs_compat_fallback(
+        self,
+        exc: Exception,
+        call_kwargs: Dict[str, Any],
+    ) -> Tuple[bool, List[str]]:
+        """
+        Apply one-shot compatibility downgrades when providers reject certain request params.
+
+        Returns:
+            (changed, removed_keys)
+        """
+        if not isinstance(call_kwargs, dict):
+            return False, []
+
+        error_text = f"{type(exc).__name__}: {exc}"
+        removed: List[str] = []
+
+        if "parallel_tool_calls" in call_kwargs and self._error_contains_param_rejection(
+            error_text, "parallel_tool_calls"
+        ):
+            call_kwargs.pop("parallel_tool_calls", None)
+            removed.append("parallel_tool_calls")
+            # Keep subsequent calls aligned with runtime-observed provider behavior.
+            self.supports_parallel_tool_calls = False
+            self.model_capabilities["supports_parallel_tool_calls"] = False
+
+        if "tool_choice" in call_kwargs and self._error_contains_param_rejection(
+            error_text, "tool_choice"
+        ):
+            call_kwargs.pop("tool_choice", None)
+            removed.append("tool_choice")
+
+        return bool(removed), removed
+
+    @staticmethod
     def _normalize_model_capabilities(value: Any) -> Dict[str, Any]:
         if not isinstance(value, dict):
             return {}
@@ -1236,6 +1302,16 @@ class LiteLLMChat:
                 try:
                     return self.backend.completion(model_kwargs)
                 except Exception as exc:
+                    compat_changed, removed_keys = self._apply_call_kwargs_compat_fallback(exc, model_kwargs)
+                    if compat_changed:
+                        logger.warning(
+                            "Model completion compatibility downgrade applied (model=%s, removed=%s), retrying: %s",
+                            model_name,
+                            ",".join(removed_keys),
+                            exc,
+                        )
+                        continue
+
                     if (not self.retry_enabled) or (not self._is_retriable_error(exc)):
                         self._log_model_call_failure(exc, model_kwargs, stream=False)
                         raise
@@ -1286,6 +1362,17 @@ class LiteLLMChat:
                     if emitted_any:
                         self._log_model_call_failure(exc, model_kwargs, stream=True)
                         raise
+
+                    compat_changed, removed_keys = self._apply_call_kwargs_compat_fallback(exc, model_kwargs)
+                    if compat_changed:
+                        logger.warning(
+                            "Model stream compatibility downgrade applied (model=%s, removed=%s), retrying: %s",
+                            model_name,
+                            ",".join(removed_keys),
+                            exc,
+                        )
+                        continue
+
                     if (not self.retry_enabled) or (not self._is_retriable_error(exc)):
                         self._log_model_call_failure(exc, model_kwargs, stream=True)
                         raise

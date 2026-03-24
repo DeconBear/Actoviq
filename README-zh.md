@@ -1,8 +1,10 @@
-# Klynx Python SDK for Agent Developmemt
+﻿# Actoviq Python SDK for Agent Development
+
+**Actoviq: Intelligence in Action**
 
 **Language / 语言**: [English](./README.md) | [简体中文](./README-zh.md)
 
-`klynx` 是一个用于构建代码智能体的 Python 框架，默认采用 `think -> act -> feedback` 循环。  
+Actoviq 是一个用于构建代码智能体的 Python 框架，默认采用 `think -> act -> feedback` 循环。  
 它支持：
 
 - 开箱即用的默认 Agent 运行时
@@ -11,7 +13,7 @@
 ### 安装（PyPI）
 
 ```bash
-pip install -U klynx
+pip install -U actoviq
 ```
 
 可选浏览器能力（仅在工具需要浏览器自动化时使用）：
@@ -33,7 +35,7 @@ export OPENAI_API_KEY="sk-..."
 #### 2）通过 builder 创建模型与运行时
 
 ```python
-from klynx import create_builder, setup_model
+from actoviq import create_builder, setup_model
 
 model = setup_model("gpt-4o")
 builder = create_builder(name="quickstart").react()
@@ -56,7 +58,7 @@ for event in agent.invoke(task="Summarize this repository architecture", thread_
 ### API 导出
 
 ```python
-from klynx import (
+from actoviq import (
     create_agent,
     create_builder,
     KlynxAgent,
@@ -76,7 +78,7 @@ from klynx import (
 #### 教程 1：直接问答模式（`builder.ask` 预设）
 
 ```python
-from klynx import create_builder, setup_model
+from actoviq import create_builder, setup_model
 
 model = setup_model("gpt-5.3")
 builder = create_builder(name="ask-demo").ask()
@@ -90,7 +92,7 @@ for event in agent.ask("Explain the key modules in this codebase", thread_id="as
 #### 教程 2：使用 `create_builder` 构建可组合运行时
 
 ```python
-from klynx import create_builder, setup_model
+from actoviq import create_builder, setup_model
 
 model = setup_model("gpt-4o")
 
@@ -111,7 +113,7 @@ for event in runtime.invoke(task="Find TODOs and propose fixes", thread_id="buil
 #### 教程 3：在默认循环后追加自定义节点
 
 ```python
-from klynx import create_builder, setup_model
+from actoviq import create_builder, setup_model
 
 model = setup_model("gpt-4o")
 
@@ -123,7 +125,7 @@ def post_process(runtime, payload):
 builder = create_builder(name="pipeline")
 builder.react()
 builder.add_node("post_process", post_process)
-builder.add_edge("klynx_loop", "post_process")
+builder.add_edge("actoviq_loop", "post_process")
 
 runtime = builder.build(working_dir=".", model=model)
 for event in runtime.invoke(task="Refactor this module", thread_id="pipeline-demo"):
@@ -144,7 +146,7 @@ runtime.add_tools("none")
 
 ### 内置工具组
 
-Klynx 内置 6 个工具组：
+Actoviq 内置 6 个工具组：
 
 - `system`: `state_update`, `run_subtask`, `parallel_tool_call`
 - `core`: `read_file`, `apply_patch`, `execute_command`, `list_directory`, `search_in_files`
@@ -176,7 +178,7 @@ agent.set_sandbox(True)
 #### 教程 6：启用 Web Search 工具
 
 ```python
-from klynx import set_tavily_api, is_tavily_configured
+from actoviq import set_tavily_api, is_tavily_configured
 
 set_tavily_api("tvly-...")
 print(is_tavily_configured())  # True
@@ -204,7 +206,7 @@ agent = create_builder(name="skills").react().build(
 默认是一次性回滚：下一次 `invoke/ask` 会从目标检查点继续。
 
 ```python
-from klynx import create_builder, setup_model
+from actoviq import create_builder, setup_model
 
 model = setup_model("gpt-4o")
 agent = create_builder(name="rollback").react().build(
@@ -282,5 +284,7 @@ setup_model("deepseek", "deepseek-chat")
 如果你需要完整的命令行与 TUI 体验，可安装：
 
 ```bash
-pip install -U klynx-cli
+pip install -U actoviq-cli
 ```
+
+

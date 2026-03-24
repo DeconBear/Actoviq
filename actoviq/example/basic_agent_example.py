@@ -1,5 +1,5 @@
-"""
-Basic Klynx library example.
+﻿"""
+Basic Actoviq library example.
 
 This example uses klynx as an installed library and keeps the default
 minimal tool surface (`system` + `core`).
@@ -21,7 +21,7 @@ from typing import Any, Dict
 
 from dotenv import load_dotenv
 
-from klynx import create_agent, setup_model
+from actoviq import create_agent, setup_model
 
 
 
@@ -113,7 +113,7 @@ def run_one_shot(agent, task: str, thread_id: str) -> None:
 
 def run_interactive(agent) -> None:
     print("\n" + "=" * 60)
-    print("Klynx Basic Library Example")
+    print("Actoviq Basic Library Example")
     print("Commands: exit | quit | clear | context")
     print("=" * 60)
 
@@ -143,7 +143,7 @@ def run_interactive(agent) -> None:
                 msgs = state_values.get("messages", [])
                 approx_tokens = 0
                 try:
-                    from klynx.agent.context_manager import TokenCounter
+                    from actoviq.agent.context_manager import TokenCounter
 
                     approx_tokens = TokenCounter.count_message_tokens(msgs) if msgs else 0
                 except Exception:
@@ -176,7 +176,7 @@ def run_interactive(agent) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Basic klynx library example.")
+    parser = argparse.ArgumentParser(description="Basic Actoviq library example.")
     parser.add_argument("--task", default="", help="Run one-shot task and exit.")
     parser.add_argument("--working-dir", default=os.getcwd(), help="Agent working directory.")
     parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="Model provider.")
@@ -207,3 +207,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

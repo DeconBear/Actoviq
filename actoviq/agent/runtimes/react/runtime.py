@@ -1,5 +1,5 @@
 ﻿"""
-Klynx agent orchestrations.
+Actoviq agent orchestrations.
 
 Define one subclass per concrete agent to customize behavior.
 
@@ -14,7 +14,7 @@ from langgraph.graph import END, StateGraph
 
 from ...graph import GraphKlynxAgent
 from ...state import AgentState
-from ...subgraphs import build_klynx_initial_state, stream_ask
+from ...subgraphs import build_actoviq_initial_state, stream_ask
 
 
 def _load_prompt_asset(*relative_parts: str, fallback: str = "") -> str:
@@ -26,14 +26,14 @@ def _load_prompt_asset(*relative_parts: str, fallback: str = "") -> str:
 
 
 class KlynxGeneralAgent(GraphKlynxAgent):
-    """Generic Klynx orchestration with the baseline system prompt."""
+    """Generic Actoviq orchestration with the baseline system prompt."""
 
     LOCKED_SYSTEM_PROMPT = _load_prompt_asset(
         "prompts",
         "system_base.md",
         fallback=(
             "# Role\n\n"
-            "You are Klynx, a task-oriented software engineering agent."
+            "You are Actoviq, a task-oriented software engineering agent."
         ),
     )
 
@@ -41,7 +41,7 @@ class KlynxGeneralAgent(GraphKlynxAgent):
         "prompts",
         "ask_base.md",
         fallback=(
-            "You are Klynx Ask Assistant. "
+            "You are Actoviq Ask Assistant. "
             "Answer the user directly and concisely."
         ),
     )
@@ -139,7 +139,7 @@ class KlynxGeneralAgent(GraphKlynxAgent):
         pending_once = bool(pending_rollback.get("once", True))
         rollback_consumed = [False]
 
-        initial_state = build_klynx_initial_state(
+        initial_state = build_actoviq_initial_state(
             self,
             task,
             thread_id=thread_id,
@@ -275,6 +275,7 @@ class KlynxGeneralAgent(GraphKlynxAgent):
 
 
 class KlynxAgent(KlynxGeneralAgent):
-    """Public default Klynx agent."""
+    """Public default Actoviq agent."""
 
     pass
+

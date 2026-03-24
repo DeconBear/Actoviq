@@ -18,14 +18,14 @@ from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, Syst
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
-from klynx.agent.tools.browser import BrowserManager
-from klynx.agent.tools.interactive_exec import InteractiveExecManager
-from klynx.agent.mcp_manager import MCPManager
-from klynx.agent.tools.terminal import TerminalManager
-from klynx.agent.tools import ToolRegistry, get_json_schemas
-from klynx.agent.tools.dispatch import ToolDispatchMixin
-from klynx.agent.tools.tui import TUIManager
-from klynx.agent.tools.web_search import WebSearchTool, is_tavily_configured
+from actoviq.agent.tools.browser import BrowserManager
+from actoviq.agent.tools.interactive_exec import InteractiveExecManager
+from actoviq.agent.mcp_manager import MCPManager
+from actoviq.agent.tools.terminal import TerminalManager
+from actoviq.agent.tools import ToolRegistry, get_json_schemas
+from actoviq.agent.tools.dispatch import ToolDispatchMixin
+from actoviq.agent.tools.tui import TUIManager
+from actoviq.agent.tools.web_search import WebSearchTool, is_tavily_configured
 
 from .backend import AgentBackend, LocalAgentBackend, resolve_runtime_paths
 from .hooks import AgentHook, AgentHookContext, HookManager, RuntimeTruthHook
@@ -200,7 +200,7 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
             working_dir: 
             model: LangChain ( max_context_tokens )
             max_iterations: .None/<=0 ().
-            memory_dir: Agent (.klynx/.rules/.memory ),
+            memory_dir: Agent (.actoviq/.rules/.memory ),
             load_project_docs:  KLYNX.md , True
             os_name: , Agent  (: windows, linux, macos)
             browser_headless: , False ()
@@ -1041,7 +1041,7 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
         return self
 
     def _load_memory_skills(self):
-        """ memory_dir/.klynx/skills ."""
+        """ memory_dir/.actoviq/skills ."""
         if not self.memory_dir:
             return self
 
@@ -1073,7 +1073,7 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
 
         if specs:
             self.add_skills(specs)
-            self._emit("info", f"[Skills]  .klynx/skills  {len(specs)} ")
+            self._emit("info", f"[Skills]  .actoviq/skills  {len(specs)} ")
         return self
     def _refresh_skills_prompt(self):
         if not self.skill_registry:
@@ -1638,7 +1638,7 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
 
     def _build_graph(self) -> StateGraph:
         """Graph orchestration is defined by concrete agent classes in agents.py."""
-        raise NotImplementedError("_build_graph must be implemented in libs/klynx/klynx/agent/agents.py")
+        raise NotImplementedError("_build_graph must be implemented in libs/actoviq/actoviq/agent/agents.py")
 
 
     def _emit(self, event_type: str, content: str, **kwargs):
@@ -1712,7 +1712,7 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
 
     def ask(self, message: str, system_prompt: str = None, thread_id: str = "default"):
         """Ask flow is defined by concrete agent classes in agents.py."""
-        raise NotImplementedError("ask must be implemented in libs/klynx/klynx/agent/agents.py")
+        raise NotImplementedError("ask must be implemented in libs/actoviq/actoviq/agent/agents.py")
 
 
     def invoke(
@@ -1723,7 +1723,7 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
         system_prompt_append: str = "",
     ):
         """Invoke flow is defined by concrete agent classes in agents.py."""
-        raise NotImplementedError("invoke must be implemented in libs/klynx/klynx/agent/agents.py")
+        raise NotImplementedError("invoke must be implemented in libs/actoviq/actoviq/agent/agents.py")
 
     def _normalize_thread_id(self, thread_id: str = "default") -> str:
         normalized = str(thread_id or "").strip()
@@ -2212,7 +2212,7 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
         system_prompt_append: str = "",
     ) -> dict:
         """Run invoke() and print streaming events in terminal."""
-        from klynx.agent.package import run_terminal_agent_stream
+        from actoviq.agent.package import run_terminal_agent_stream
         return run_terminal_agent_stream(
             self,
             task,
@@ -2223,7 +2223,7 @@ class KlynxAgent(PromptBuilderMixin, NodesMixin, ToolDispatchMixin, ToolboxRunti
 
     def run_terminal_ask_stream(self, message: str, system_prompt: str = None, thread_id: str = "default") -> str:
         """ agent.ask(),,"""
-        from klynx.agent.package import run_terminal_ask_stream
+        from actoviq.agent.package import run_terminal_ask_stream
         return run_terminal_ask_stream(self, message, system_prompt, thread_id)
 
 
@@ -2319,6 +2319,7 @@ def create_agent(working_dir: str = ".", model=None, max_iterations: Optional[in
         key: value for key, value in requested_kwargs.items() if key in accepted_keys
     }
     return agent_class(**supported)
+
 
 
 

@@ -8,9 +8,9 @@ from langgraph.graph import END, StateGraph
 
 load_dotenv()
 
-from klynx import setup_model
-from klynx.agent.agents import KlynxGeneralAgent
-from klynx.agent.state import AgentState
+from actoviq import setup_model
+from actoviq.agent.agents import KlynxGeneralAgent
+from actoviq.agent.state import AgentState
 
 
 class DirectAnswerExampleAgent(KlynxGeneralAgent):
@@ -53,7 +53,7 @@ class DirectAnswerExampleAgent(KlynxGeneralAgent):
 def main() -> None:
     api_key = os.getenv("DEEPSEEK_API_KEY", "")
     if not api_key:
-        print("Missing DEEPSEEK_API_KEY. Set it in libs/klynx/klynx/.env or environment.")
+        print("Missing DEEPSEEK_API_KEY. Set it in libs/actoviq/actoviq/.env or environment.")
         sys.exit(1)
 
     model = setup_model("deepseek", "deepseek-reasoner", api_key)
@@ -81,3 +81,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

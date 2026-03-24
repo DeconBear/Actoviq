@@ -1,4 +1,4 @@
-"""Builder APIs for composable Klynx runtimes."""
+﻿"""Builder APIs for composable Klynx runtimes."""
 
 from __future__ import annotations
 
@@ -335,18 +335,18 @@ class KlynxGraphBuilder:
         return self
 
     def _ensure_klynx_loop_entry(self) -> None:
-        if "klynx_loop" not in self._nodes:
-            self.add_node("klynx_loop")
+        if "actoviq_loop" not in self._nodes:
+            self.add_node("actoviq_loop")
         if not self._entry_point:
-            self._entry_point = "klynx_loop"
+            self._entry_point = "actoviq_loop"
 
     def react(self, **runtime_defaults: Any):
         """
         Configure this builder for the default ReAct runtime.
 
         This is a convenience preset equivalent to:
-        - add_node("klynx_loop")
-        - set entry point to "klynx_loop" (when unset)
+        - add_node("actoviq_loop")
+        - set entry point to "actoviq_loop" (when unset)
         - runtime default `mode="react"`
         """
         self._ensure_klynx_loop_entry()
@@ -409,3 +409,4 @@ __all__ = [
     "KlynxGraphBuilder",
     "create_builder",
 ]
+

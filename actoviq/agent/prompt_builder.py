@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 
-from klynx.agent.context_manager import TokenCounter
+from actoviq.agent.context_manager import TokenCounter
 
 
 class PromptBuilderMixin:
@@ -532,7 +532,7 @@ class PromptBuilderMixin:
             rel_path = (
                 os.path.relpath(memory_path, self.working_dir)
                 if self.working_dir
-                else ".klynx/.memory"
+                else ".actoviq/.memory"
             )
             prompt_parts.append(self._load_prompt_fragment("fragments", "memory_mode.md"))
             prompt_parts.append(
@@ -2616,5 +2616,6 @@ class PromptBuilderMixin:
         """ Agent ()."""
         registry = getattr(self, "skill_registry", {}) or {}
         return sorted(registry.keys())
+
 
 

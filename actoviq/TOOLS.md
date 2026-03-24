@@ -1,14 +1,14 @@
-# Klynx Tools Snapshot
+﻿# Actoviq Tools Snapshot
 
 This document lists built-in tools, tool groups, and the key tool guidance injected into the model.
 
 ## Source of Truth
 
-- `libs/klynx/klynx/agent/graph.py`
-- `libs/klynx/klynx/agent/tools/registry.py`
-- `libs/klynx/klynx/agent/prompt_builder.py`
-- `libs/klynx/klynx/agent/prompts/fragments/tool_selection.md`
-- `libs/klynx/klynx/agent/prompts/system_base.md`
+- `libs/actoviq/actoviq/agent/graph.py`
+- `libs/actoviq/actoviq/agent/tools/registry.py`
+- `libs/actoviq/actoviq/agent/prompt_builder.py`
+- `libs/actoviq/actoviq/agent/prompts/fragments/tool_selection.md`
+- `libs/actoviq/actoviq/agent/prompts/system_base.md`
 
 ## Default Loading
 
@@ -100,3 +100,5 @@ Total groups: **6**
 
 - `write_to_file`, `replace_in_file`, `create_directory`, `preview_file`, and group `extended_fs` are removed from built-in tool groups and schemas.
 - Runtime enforces active-tool execution; inactive tools are rejected.
+
+

@@ -1,4 +1,4 @@
-"""Single-pass ReAct subgraph: Think + Act without loop."""
+﻿"""Single-pass ReAct subgraph: Think + Act without loop."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List
 
 from langchain_core.messages import AIMessage
 
-from .klynx_loop import build_klynx_initial_state
+from .actoviq_loop import build_actoviq_initial_state
 
 
 def _drain_event_buffer(agent) -> List[dict]:
@@ -83,7 +83,7 @@ def run_react_once_node(runtime, payload: Dict[str, Any]) -> Iterable[dict]:
 
     thinking_context = bool(invoke_kwargs.get("thinking_context", False))
     system_prompt_append = str(invoke_kwargs.get("system_prompt_append", "") or "")
-    state = build_klynx_initial_state(
+    state = build_actoviq_initial_state(
         agent,
         task,
         thread_id=thread_id,
@@ -111,3 +111,4 @@ def run_react_once_node(runtime, payload: Dict[str, Any]) -> Iterable[dict]:
 def build_react_once_subgraph(builder, *, node_name: str = "react_once"):
     builder.add_node(node_name)
     return builder
+

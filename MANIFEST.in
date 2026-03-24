@@ -1,12 +1,13 @@
-include LICENSE
+﻿include LICENSE
 include README.md
-recursive-include klynx/skills *
-include klynx/mcp_servers.json.example
+recursive-include actoviq/skills *
+include actoviq/mcp_servers.json.example
 prune build
 prune dist
-prune klynx.egg-info
-prune klynx/skills/system/skill-creator/scripts/__pycache__
-prune klynx/skills/system/skill-installer/scripts/__pycache__
-recursive-exclude klynx __pycache__ *
-recursive-exclude klynx *.py[cod]
+prune actoviq.egg-info
+prune actoviq/skills/system/skill-creator/scripts/__pycache__
+prune actoviq/skills/system/skill-installer/scripts/__pycache__
+recursive-exclude actoviq __pycache__ *
+recursive-exclude actoviq *.py[cod]
 global-exclude *.py[cod]
+

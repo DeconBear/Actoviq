@@ -3,7 +3,7 @@ requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "klynx"
+name = "actoviq"
 version = "0.0.23"
 description = "A sophisticated, universal agentic AI coding framework built on LangGraph and LiteLLM."
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -41,8 +41,8 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/DeconBear/klynx-dev"
-"Bug Tracker" = "https://github.com/DeconBear/klynx-dev/issues"
+"Homepage" = "https://github.com/DeconBear/Actoviq"
+"Bug Tracker" = "https://github.com/DeconBear/Actoviq/issues"
 
 [tool.setuptools]
 package-dir = {"" = "."}
@@ -50,11 +50,11 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["klynx*"]
+include = ["actoviq*"]
 exclude = ["tests*", "tutorials*"]
 
 [tool.setuptools.package-data]
-klynx = [
+actoviq = [
     "**/*.json",
     "**/*.txt",
     "**/*.md",
@@ -65,8 +65,9 @@ klynx = [
 ]
 
 [tool.setuptools.exclude-package-data]
-klynx = [
+actoviq = [
     "**/*.py[cod]",
     "**/__pycache__/*",
 ]
+
 

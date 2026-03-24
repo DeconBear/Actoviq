@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable
 from langchain_core.messages import HumanMessage
 
 
-def build_klynx_initial_state(
+def build_actoviq_initial_state(
     agent,
     task: str,
     *,
@@ -160,7 +160,7 @@ def build_klynx_initial_state(
     }
 
 
-def run_klynx_loop_node(runtime, payload: Dict[str, Any]) -> Iterable[dict]:
+def run_actoviq_loop_node(runtime, payload: Dict[str, Any]) -> Iterable[dict]:
     agent = runtime._ensure_loop_agent()
     task = str(payload.get("task", "") or "")
     thread_id = str(payload.get("thread_id", "default") or "default")
@@ -168,8 +168,9 @@ def run_klynx_loop_node(runtime, payload: Dict[str, Any]) -> Iterable[dict]:
     return agent.invoke(task=task, thread_id=thread_id, **invoke_kwargs)
 
 
-def build_klynx_loop_subgraph(builder, *, node_name: str = "klynx_loop"):
+def build_actoviq_loop_subgraph(builder, *, node_name: str = "actoviq_loop"):
     builder.add_node(node_name)
     return builder
+
 
 

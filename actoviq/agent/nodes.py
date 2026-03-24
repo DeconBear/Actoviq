@@ -13,8 +13,8 @@ from typing import Any, Dict, List
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
 
-from klynx.agent.context_manager import TokenCounter
-from klynx.model.adapter import LiteLLMResponse, normalize_usage_payload
+from actoviq.agent.context_manager import TokenCounter
+from actoviq.model.adapter import LiteLLMResponse, normalize_usage_payload
 
 from .routing import RoutingPolicy
 from .state import AgentState
@@ -57,7 +57,7 @@ class NodesMixin:
         
         if not os.path.isdir(klynx_dir):
             os.makedirs(klynx_dir, exist_ok=True)
-            self._emit("info", f"[]  .klynx/ : {klynx_dir}")
+            self._emit("info", f"[]  .actoviq/ : {klynx_dir}")
         
         #  .rules 
         rules_path = os.path.join(klynx_dir, ".rules")
@@ -65,7 +65,7 @@ class NodesMixin:
             template = '<rules>\n</rules>'
             with open(rules_path, 'w', encoding='utf-8') as f:
                 f.write(template)
-            self._emit("info", "[]  .klynx/.rules ")
+            self._emit("info", "[]  .actoviq/.rules ")
         
         #  .memory 
         memory_path = os.path.join(klynx_dir, ".memory")
@@ -73,18 +73,18 @@ class NodesMixin:
             template = '<memory>\n</memory>'
             with open(memory_path, 'w', encoding='utf-8') as f:
                 f.write(template)
-            self._emit("info", "[]  .klynx/.memory ")
+            self._emit("info", "[]  .actoviq/.memory ")
 
         #  skills ()
         skills_dir = os.path.join(klynx_dir, "skills")
         if not os.path.isdir(skills_dir):
             os.makedirs(skills_dir, exist_ok=True)
-            self._emit("info", "[]  .klynx/skills ")
+            self._emit("info", "[]  .actoviq/skills ")
 
 
     def _load_rules(self) -> str:
         """
-         .klynx/.rules ( memory_dir )
+         .actoviq/.rules ( memory_dir )
         
         Returns:
             .rules 
@@ -95,18 +95,18 @@ class NodesMixin:
         rules_path = os.path.join(self.memory_dir, ".klynx", ".rules")
         
         if not os.path.isfile(rules_path):
-            self._emit("info", "[] .klynx/.rules ")
+            self._emit("info", "[] .actoviq/.rules ")
             return ""
         
         try:
             with open(rules_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read().strip()
             if content:
-                self._emit("info", f"[]  .klynx/.rules ({len(content)} )")
+                self._emit("info", f"[]  .actoviq/.rules ({len(content)} )")
                 return content
             return ""
         except Exception as e:
-            self._emit("error", f"[]  .klynx/.rules : {e}")
+            self._emit("error", f"[]  .actoviq/.rules : {e}")
             return ""
 
     def _normalize_focus_text(self, text: Any) -> str:
@@ -345,18 +345,18 @@ class NodesMixin:
         
         :
         1.  memory_dir ,/ .klynx  .rules/.memory 
-        2.  .klynx/.rules  state
+        2.  .actoviq/.rules  state
         """
         if self.memory_dir:
             self._emit("info", f"[]  .klynx  ({self.memory_dir})...")
             self._init_klynx_dir()
             rules_content = self._load_rules()
-            #  memory_dir/.klynx/skills ()
+            #  memory_dir/.actoviq/skills ()
             if hasattr(self, "_load_memory_skills"):
                 try:
                     self._load_memory_skills()
                 except Exception as e:
-                    self._emit("warning", f"[Skills]  .klynx/skills : {e}")
+                    self._emit("warning", f"[Skills]  .actoviq/skills : {e}")
         else:
             self._emit("info", "[]  memory_dir, .klynx ")
             rules_content = ""
@@ -1038,4 +1038,5 @@ class NodesMixin:
         if decision.warning:
             self._emit("warning", f"[] {decision.warning}")
         return decision.route
+
 

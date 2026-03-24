@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from dotenv import load_dotenv
 
-from klynx import create_agent, setup_model
+from actoviq import create_agent, setup_model
 
 
 load_dotenv()
@@ -655,7 +655,7 @@ def main():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("Klynx Agent — 精简版计划/执行示例")
+    print("Actoviq Agent — 精简版计划/执行示例")
     print(f"工作目录: {working_dir}")
     print("=" * 60)
 
@@ -748,3 +748,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

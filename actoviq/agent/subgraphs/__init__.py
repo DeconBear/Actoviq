@@ -1,11 +1,11 @@
-"""Built-in subgraph registry."""
+﻿"""Built-in subgraph registry."""
 
 from __future__ import annotations
 
 from typing import Callable, Dict
 
 from .ask import build_ask_messages, stream_ask, stream_model_answer
-from .klynx_loop import build_klynx_initial_state, build_klynx_loop_subgraph, run_klynx_loop_node
+from .actoviq_loop import build_actoviq_initial_state, build_actoviq_loop_subgraph, run_actoviq_loop_node
 from .react_once import (
     act_once_node,
     build_react_once_subgraph,
@@ -19,7 +19,7 @@ BuiltinNodeHandler = Callable[..., object]
 
 def get_builtin_subgraph_registry() -> Dict[str, BuiltinNodeHandler]:
     return {
-        "klynx_loop": run_klynx_loop_node,
+        "actoviq_loop": run_actoviq_loop_node,
         "react_once": run_react_once_node,
     }
 
@@ -27,9 +27,9 @@ def get_builtin_subgraph_registry() -> Dict[str, BuiltinNodeHandler]:
 __all__ = [
     "BuiltinNodeHandler",
     "get_builtin_subgraph_registry",
-    "build_klynx_initial_state",
-    "build_klynx_loop_subgraph",
-    "run_klynx_loop_node",
+    "build_actoviq_initial_state",
+    "build_actoviq_loop_subgraph",
+    "run_actoviq_loop_node",
     "build_react_once_subgraph",
     "run_react_once_node",
     "think_once_node",
@@ -39,3 +39,4 @@ __all__ = [
     "build_ask_messages",
     "stream_model_answer",
 ]
+
